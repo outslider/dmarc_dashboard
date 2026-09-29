@@ -40,6 +40,108 @@ def provider_of(ptr: str) -> str:
     return ""
 
 
+# policy_evaluated/reason (受信側が判定を上書きした理由) の表示名
+OVERRIDE_LABELS = {
+    "forwarded": "転送メールと判断",
+    "sampled_out": "pct の対象外",
+    "trusted_forwarder": "信頼済みの転送元",
+    "mailing_list": "メーリングリスト",
+    "local_policy": "受信側の独自ポリシー",
+    "other": "その他",
+}
+
+# 失敗理由の分類コード → 一覧表示用の短いラベル
+FAILURE_LABELS = {
+    "spf_misaligned": "SPF ドメイン不一致",
+    "spf_fail": "SPF 失敗",
+    "spf_none": "SPF 評価なし",
+    "spf_error": "SPF エラー",
+    "dkim_misaligned": "DKIM ドメイン不一致",
+    "dkim_fail": "DKIM 検証失敗",
+    "dkim_none": "DKIM 署名なし",
+    "dkim_error": "DKIM エラー",
+    "other": "その他",
+}
+
+
+def _aligned(auth_domain: str, header_from: str, mode: str) -> bool:
+    a, h = (auth_domain or "").lower().strip("."), (header_from or "").lower().strip(".")
+    if not a or not h:
+        return False
+    return a == h if mode == "s" else org_domain(a) == org_domain(h)
+
+
+def failure_reasons(header_from: str, spf_eval: str, dkim_eval: str, spf, dkims, adkim: str = "r",
+                    aspf: str = "r", envelope_from: str = "") -> List[Dict]:
+    """SPF / DKIM の生の認証結果とドメインの突き合わせから、DMARC 失敗の理由を推定する。
+
+    spf: (domain, result) または None / dkims: [(domain, result), ...]
+    DMARC に合格している (どちらかがアライメント込みで pass) 場合は空リスト。
+    """
+    if spf_eval == "pass" or dkim_eval == "pass":
+        return []
+    out = []
+
+    def add(code, detail):
+        out.append({"code": code, "label": FAILURE_LABELS[code], "detail": detail})
+
+    strict_note = lambda mode, d: ("。adkim/aspf=s (厳格) のため完全一致が必要です"
+                                   if mode == "s" and org_domain(d) == org_domain(header_from) else "")
+
+    # SPF
+    sd, sr = (spf or ("", "none"))
+    sd = sd or envelope_from
+    sr = (sr or "none").lower()
+    if sr == "pass":
+        if _aligned(sd, header_from, aspf) is False:
+            add("spf_misaligned", f"SPF は {sd or '(不明)'} で合格しましたが、From ({header_from}) とドメインが一致しません"
+                + strict_note(aspf, sd))
+    elif sr in ("fail", "softfail", "neutral"):
+        add("spf_fail", f"送信元 IP が {sd or '(不明)'} の SPF レコードで許可されていません ({sr})")
+    elif sr == "permerror":
+        add("spf_error", f"{sd or '(不明)'} の SPF レコードに誤りがあります (構文誤り、または DNS 参照 10 回の上限超過)")
+    elif sr == "temperror":
+        add("spf_error", f"{sd or '(不明)'} の SPF 確認中に DNS の一時エラーが発生しました")
+    else:
+        add("spf_none", f"{sd or 'エンベロープ送信者'} に SPF レコードがない、または評価されていません")
+
+    # DKIM
+    sigs = [(d.lower(), (r or "").lower()) for d, r in dkims if d]
+    passed = [d for d, r in sigs if r == "pass"]
+    if not sigs:
+        add("dkim_none", "DKIM 署名が付いていません")
+    elif passed and not any(_aligned(d, header_from, adkim) for d in passed):
+        add("dkim_misaligned", f"DKIM 署名 ({', '.join(sorted(set(passed))[:3])}) は合格しましたが、From ({header_from}) とドメインが一致しません"
+            + strict_note(adkim, passed[0]))
+    elif not passed:
+        failed = [d for d, r in sigs if r == "fail"]
+        if failed:
+            add("dkim_fail", f"{', '.join(sorted(set(failed))[:3])} の署名検証に失敗しました (転送・メーリングリストでの本文改変、または公開鍵の不一致)")
+        else:
+            d, r = sigs[0]
+            add("dkim_error", f"{d} の DKIM を確認できませんでした ({r}: 公開鍵の DNS レコードが見つからない等)")
+    if not out:
+        # 認証結果上は一致しているのに、受信側は不合格と判定したケース (受信側のドメイン判定の差など)
+        add("other", "認証結果からは原因を特定できません。受信側の評価では SPF / DKIM ともアライメント不合格です")
+    return out
+
+
+def override_reasons(reasons: str) -> List[str]:
+    out = []
+    for part in (reasons or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        typ, _, comment = part.partition(":")
+        label = OVERRIDE_LABELS.get(typ.strip(), typ.strip())
+        out.append(f"{label} ({typ.strip()})" + (f": {comment.strip()}" if comment.strip() else ""))
+    return out
+
+
+def _dkim_pairs(dkim_domains: str):
+    return [tuple(x.rsplit(":", 1)) for x in (dkim_domains or "").split(",") if ":" in x]
+
+
 def _where(domain: Optional[str], start: Optional[int], end: Optional[int]):
     sql, args = [], []
     if domain:
@@ -136,7 +238,7 @@ def dashboard(conn: sqlite3.Connection, domain: Optional[str] = None,
     for row in conn.execute(f"""
         SELECT rp.domain, r.source_ip ip, r.count, r.dmarc_pass, r.spf_eval, r.dkim_eval, r.disposition,
                r.header_from, r.envelope_from, r.spf_domain, r.spf_result, r.dkim_domains,
-               COALESCE(i.ptr, '') ptr
+               rp.adkim, rp.aspf, COALESCE(i.ptr, '') ptr
         FROM records r JOIN reports rp ON rp.id = r.report_pk
         LEFT JOIN ip_info i ON i.ip = r.source_ip{where}""", args):
         _accumulate(src, row)
@@ -178,9 +280,14 @@ def _accumulate(src: Dict, row) -> None:
         "ip": row["ip"], "ptr": row["ptr"], "provider": provider_of(row["ptr"]),
         "messages": 0, "pass": 0, "spf_aligned": 0, "dkim_aligned": 0,
         "spf_raw_pass": 0, "dkim_raw_pass": 0, "header_from": set(), "spf_domains": set(),
-        "dkim_domains": set(), "quarantine": 0, "reject": 0,
+        "dkim_domains": set(), "quarantine": 0, "reject": 0, "fail_reasons": defaultdict(int),
     })
     c = row["count"]
+    if not row["dmarc_pass"]:
+        for f in failure_reasons(row["header_from"], row["spf_eval"], row["dkim_eval"],
+                                 (row["spf_domain"], row["spf_result"]), _dkim_pairs(row["dkim_domains"]),
+                                 row["adkim"], row["aspf"], row["envelope_from"]):
+            s["fail_reasons"][f["code"]] += c
     s["messages"] += c
     s["pass"] += c if row["dmarc_pass"] else 0
     s["spf_aligned"] += c if row["spf_eval"] == "pass" else 0
@@ -207,6 +314,8 @@ def _finish_sources(src: Dict) -> List[Dict]:
         s["status"] = _source_status(s)
         for key in ("header_from", "spf_domains", "dkim_domains"):
             s[key] = sorted(s[key])
+        s["fail_reasons"] = [{"code": k, "label": FAILURE_LABELS[k], "messages": v}
+                             for k, v in sorted(s["fail_reasons"].items(), key=lambda kv: -kv[1])]
         out.append(s)
     out.sort(key=lambda s: -s["messages"])
     return out
@@ -229,13 +338,18 @@ def record_details(conn: sqlite3.Connection, ip: str, domain: Optional[str] = No
     where = (where + " AND " if where else " WHERE ") + "r.source_ip = ?"
     rows = conn.execute(f"""
         SELECT rp.org_name, rp.begin_ts, rp.end_ts, rp.domain, r.count, r.disposition, r.dkim_eval,
-               r.spf_eval, r.header_from, r.envelope_from, r.reasons, r.auth_json
+               r.spf_eval, r.header_from, r.envelope_from, r.reasons, r.auth_json, rp.adkim, rp.aspf
         FROM records r JOIN reports rp ON rp.id = r.report_pk{where}
         ORDER BY rp.begin_ts DESC LIMIT 500""", args + [ip])
     out = []
     for row in rows:
         d = dict(row)
         d["auth"] = json.loads(d.pop("auth_json") or "[]")
+        spf = next(((a["domain"], a["result"]) for a in d["auth"] if a["kind"] == "spf"), None)
+        dkims = [(a["domain"], a["result"]) for a in d["auth"] if a["kind"] == "dkim"]
+        d["failures"] = failure_reasons(d["header_from"], d["spf_eval"], d["dkim_eval"], spf, dkims,
+                                        d.pop("adkim") or "r", d.pop("aspf") or "r", d["envelope_from"])
+        d["overrides"] = override_reasons(d["reasons"])
         out.append(d)
     return out
 

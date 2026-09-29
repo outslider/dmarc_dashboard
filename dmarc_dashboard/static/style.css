@@ -165,6 +165,8 @@ th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--gri
 th { color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--surface); }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.wrap { white-space: normal; min-width: 200px; }
+td.reasons { min-width: 320px; }
+.reason-list { display: grid; gap: 4px; }
 tbody tr.clickable { cursor: pointer; }
 tbody tr.clickable:hover, tbody tr.clickable:focus-visible { background: var(--wash); outline: none; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }

@@ -138,6 +138,38 @@ class StoreAndAnalyticsTest(unittest.TestCase):
         self.assertEqual([i["domain"] for i in mis], ["example.co.jp"])
         self.assertTrue(all(i["domain"] for i in d["insights"]))
 
+    def test_failure_reasons(self):
+        fr = analytics.failure_reasons
+        codes = lambda *a, **k: [f["code"] for f in fr(*a, **k)]
+        hf = "example.co.jp"
+        self.assertEqual(fr(hf, "pass", "fail", None, []), [])
+        # 外部サービス (自ドメインで署名していない)
+        self.assertEqual(codes(hf, "fail", "fail", ("sendgrid.net", "pass"), [("sendgrid.net", "pass")]),
+                         ["spf_misaligned", "dkim_misaligned"])
+        # なりすまし
+        self.assertEqual(codes(hf, "fail", "fail", ("example.co.jp", "softfail"), []), ["spf_fail", "dkim_none"])
+        # 転送で本文が改変された
+        self.assertEqual(codes(hf, "fail", "fail", ("example.co.jp", "fail"), [("example.co.jp", "fail")]),
+                         ["spf_fail", "dkim_fail"])
+        self.assertEqual(codes(hf, "fail", "fail", ("example.co.jp", "permerror"), [("example.co.jp", "temperror")]),
+                         ["spf_error", "dkim_error"])
+        self.assertEqual(codes(hf, "fail", "fail", None, []), ["spf_none", "dkim_none"])
+        # サブドメインで署名 + adkim=s (厳格) → 不一致。relaxed なら DMARC 合格のはずなので不一致扱いしない
+        strict = fr(hf, "fail", "fail", ("mail.example.co.jp", "pass"), [("mail.example.co.jp", "pass")], "s", "s")
+        self.assertEqual([f["code"] for f in strict], ["spf_misaligned", "dkim_misaligned"])
+        self.assertIn("厳格", strict[0]["detail"])
+        self.assertEqual(codes(hf, "fail", "fail", ("mail.example.co.jp", "pass"), [("mail.example.co.jp", "pass")]), ["other"])
+
+    def test_failure_reasons_in_dashboard(self):
+        ingest.import_bytes(self.conn, XML, "a.xml")
+        src = {x["ip"]: x for x in analytics.dashboard(self.conn)["sources"]}
+        self.assertEqual([f["code"] for f in src["198.51.100.1"]["fail_reasons"]],
+                         ["spf_misaligned", "dkim_misaligned"])
+        self.assertEqual(src["192.0.2.1"]["fail_reasons"], [])
+        rec = analytics.record_details(self.conn, "198.51.100.1")[0]
+        self.assertEqual(rec["overrides"], ["転送メールと判断 (forwarded): x"])
+        self.assertEqual(len(rec["failures"]), 2)
+
     def test_org_domain(self):
         self.assertEqual(analytics.org_domain("mail.shop.example.co.jp"), "example.co.jp")
         self.assertEqual(analytics.org_domain("bounce.example.com"), "example.com")

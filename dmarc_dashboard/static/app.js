@@ -367,12 +367,29 @@ function renderSources() {
     { label: "From ドメイン", render: (r) => r.header_from.join(", ") },
     { label: "メッセージ", num: 1, render: (r) => fmt(r.messages) },
     { label: "失敗", num: 1, render: (r) => fmt(r.fail) },
+    { label: "主な失敗理由", render: (r) => failSummary(r) },
     { label: "合格率", render: (r) => meter(r.pass_rate) },
     { label: "SPF 整合", num: 1, render: (r) => pct((r.spf_aligned * 100) / r.messages) },
     { label: "DKIM 整合", num: 1, render: (r) => pct((r.dkim_aligned * 100) / r.messages) },
     { label: "SPF ドメイン", cls: "dim", render: (r) => r.spf_domains.join(", ") },
     { label: "DKIM 署名", cls: "dim", render: (r) => r.dkim_domains.join(", ") },
   ], rows, openDetail);
+}
+
+// 送信元一覧: 失敗の多い理由から最大 2 つ (残りはツールチップ)
+function failSummary(r) {
+  const fr = r.fail_reasons || [];
+  if (!fr.length) return el("span", { class: "dim" }, "–");
+  const title = fr.map((f) => `${f.label}: ${fmt(f.messages)} 通`).join("\n");
+  return el("span", { title }, fr.slice(0, 2).map((f) => f.label).join(" · "), fr.length > 2 ? el("span", { class: "dim" }, ` 他${fr.length - 2}`) : null);
+}
+// 詳細: 1 レコードの失敗理由と、受信側による判定の上書き
+function failDetail(r) {
+  const items = [];
+  if (!r.failures.length) items.push(el("div", { class: "res-pass" }, "DMARC 合格"));
+  for (const f of r.failures) items.push(el("div", {}, el("b", {}, f.label), el("span", { class: "dim" }, ` ${f.detail}`)));
+  for (const o of r.overrides) items.push(el("div", {}, el("b", {}, "受信側の判断"), el("span", { class: "dim" }, ` ${o}`)));
+  return el("div", { class: "reason-list" }, items);
 }
 
 async function openDetail(src) {
@@ -388,9 +405,9 @@ async function openDetail(src) {
     { label: "処置", render: (r) => r.disposition },
     { label: "SPF (整合)", render: (r) => res(r.spf_eval) },
     { label: "DKIM (整合)", render: (r) => res(r.dkim_eval) },
+    { label: "失敗理由", cls: "wrap reasons", render: (r) => failDetail(r) },
     { label: "認証結果 (生)", cls: "wrap", render: (r) => el("span", {}, r.auth.map((a, i) => el("span", {},
       i ? " · " : "", `${a.kind.toUpperCase()} ${a.domain}${a.selector ? ` (${a.selector})` : ""}: `, res(a.result)))) },
-    { label: "理由", cls: "wrap dim", render: (r) => r.reasons },
   ], rows);
   $("#detail").showModal();
 }
