@@ -1,0 +1,24 @@
+# systemd ユニット例:  /etc/systemd/system/dmarc-dashboard.service
+#   useradd -r -s /sbin/nologin dmarc
+#   cp -r <このリポジトリ> /opt/dmarc && chown -R dmarc: /opt/dmarc
+#   systemctl daemon-reload && systemctl enable --now dmarc-dashboard
+[Unit]
+Description=DMARC Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=dmarc
+WorkingDirectory=/opt/dmarc
+# IMAP パスワードは config.ini に書かず、ここ (root のみ読める) に置くこともできます:
+#   /etc/dmarc-dashboard.env に DMARC_IMAP_PASSWORD=xxxx と記載し chmod 600
+EnvironmentFile=-/etc/dmarc-dashboard.env
+ExecStart=/usr/bin/python3 -m dmarc_dashboard -c /opt/dmarc/config.ini serve --fetch-interval 3600
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/dmarc/data
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DMARC ダッシュボード</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>DMARC ダッシュボード</h1>
+    <span class="sub" id="period-label"></span>
+  </div>
+  <div class="actions">
+    <label class="btn" title=".xml / .gz / .zip / .eml を選択">
+      ファイル取り込み
+      <input type="file" id="upload" multiple accept=".xml,.gz,.zip,.eml" hidden>
+    </label>
+    <button class="btn" id="fetch-btn" hidden>メールを取得</button>
+    <button class="btn ghost" id="theme-btn" aria-label="テーマ切替">◐</button>
+  </div>
+</header>
+
+<div class="filters" role="toolbar" aria-label="フィルター">
+  <div class="seg" id="range-presets">
+    <button data-days="7">7日</button>
+    <button data-days="30" class="on">30日</button>
+    <button data-days="90">90日</button>
+    <button data-days="0">全期間</button>
+  </div>
+  <label class="field">開始 <input type="date" id="from"></label>
+  <label class="field">終了 <input type="date" id="to"></label>
+  <label class="field">ドメイン
+    <select id="domain"><option value="">すべて</option></select>
+  </label>
+  <span class="toast" id="toast" role="status" aria-live="polite"></span>
+</div>
+
+<main id="main">
+  <section class="kpis">
+    <div class="hero card">
+      <div class="label">DMARC 合格率</div>
+      <div class="hero-value" id="k-rate">–</div>
+      <div class="hero-sub" id="k-rate-sub"></div>
+    </div>
+    <div class="tiles">
+      <div class="tile card"><div class="label">総メッセージ数</div><div class="value" id="k-messages">–</div></div>
+      <div class="tile card"><div class="label">DMARC 失敗</div><div class="value" id="k-fail">–</div></div>
+      <div class="tile card"><div class="label">SPF アライン率</div><div class="value" id="k-spf">–</div></div>
+      <div class="tile card"><div class="label">DKIM アライン率</div><div class="value" id="k-dkim">–</div></div>
+      <div class="tile card"><div class="label">隔離 / 拒否</div><div class="value" id="k-disp">–</div></div>
+      <div class="tile card"><div class="label">送信元 IP</div><div class="value" id="k-sources">–</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>診断と推奨アクション</h2>
+    <ul class="insights" id="insights"></ul>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <div class="card-head">
+        <h2>日別メッセージ数</h2>
+        <div class="legend">
+          <span><i class="sw pass"></i>DMARC 合格</span>
+          <span><i class="sw fail"></i>DMARC 失敗</span>
+        </div>
+      </div>
+      <div class="chart" id="chart-daily"></div>
+      <details class="tableview"><summary>表で見る</summary><div id="tbl-daily"></div></details>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>日別 DMARC 合格率</h2></div>
+      <div class="chart" id="chart-rate"></div>
+    </div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>認証結果の内訳</h2>
+      <p class="note">アライメント込みの評価 (policy_evaluated) に基づく</p>
+      <div id="chart-auth"></div>
+    </div>
+    <div class="card">
+      <h2>レポーター別</h2>
+      <p class="note">レポートを送ってきた受信側組織</p>
+      <div id="chart-reporters"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>ドメイン別</h2>
+    <div class="table-wrap"><table id="tbl-domains"></table></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>送信元</h2>
+      <div class="seg small" id="src-filter">
+        <button data-f="" class="on">すべて</button>
+        <button data-f="fail">失敗あり</button>
+        <button data-f="unauthenticated">なりすまし疑い</button>
+        <button data-f="misaligned">設定不備疑い</button>
+      </div>
+    </div>
+    <p class="note">行をクリックすると詳細を表示します</p>
+    <div class="table-wrap scroll"><table id="tbl-sources"></table></div>
+  </section>
+
+  <section class="card">
+    <h2>受信したレポート</h2>
+    <div class="table-wrap scroll"><table id="tbl-reports"></table></div>
+  </section>
+</main>
+
+<dialog id="detail">
+  <div class="dlg-head">
+    <h2 id="detail-title"></h2>
+    <button class="btn" id="detail-close">閉じる</button>
+  </div>
+  <div class="table-wrap"><table id="tbl-detail"></table></div>
+</dialog>
+
+<div class="tooltip" id="tooltip" role="tooltip"></div>
+<div class="drop" id="drop">ここにドロップして取り込み</div>
+<script src="app.js"></script>
+</body>
+</html>
