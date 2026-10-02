@@ -55,8 +55,19 @@
   </section>
 
   <section class="card">
-    <h2>診断と推奨アクション</h2>
-    <ul class="insights" id="insights"></ul>
+    <div class="card-head">
+      <h2>診断と推奨アクション</h2>
+      <div class="ins-tools">
+        <div class="seg small" id="ins-filter" role="group" aria-label="重要度で絞り込み"></div>
+        <button class="btn small" id="ins-expand">すべて開く</button>
+      </div>
+    </div>
+    <p class="note">各項目をクリックすると、理由と対策の手順が表示されます</p>
+    <div id="insights"></div>
+    <details class="glossary">
+      <summary>用語の説明 (SPF・DKIM・アライメントなど)</summary>
+      <dl id="glossary"></dl>
+    </details>
   </section>
 
   <section class="grid2">
@@ -120,6 +131,8 @@
     <h2 id="detail-title"></h2>
     <button class="btn" id="detail-close">閉じる</button>
   </div>
+  <div id="detail-summary"></div>
+  <h3 class="sub-h">レポートの内容</h3>
   <div class="table-wrap"><table id="tbl-detail"></table></div>
 </dialog>
 

@@ -16,6 +16,8 @@ SENDERS = [
     ("198.51.100.40", "mail.partner-mlist.example", 40, "fail", "partner-mlist.example", "pass", "{d}"),
     ("203.0.113.66", "", 35, "fail", "{d}", "none", ""),
     ("203.0.113.77", "unknown.dynamic.example.net", 18, "softfail", "{d}", "fail", "{d}"),
+    # エラーメール / 自動返信 (Envelope From が空 → SPF は HELO 名で検査、DKIM 署名なし)
+    ("198.51.100.50", "mx01.group-mail.example", 12, "pass", "helo:mx01.group-mail.example", "none", ""),
 ]
 REPORTERS = [("google.com", "noreply-dmarc-support@google.com", 0.55),
              ("Enterprise Outlook", "dmarcreport@microsoft.com", 0.3),
@@ -26,16 +28,18 @@ PTRS = {ip: ptr for ip, ptr, *_ in SENDERS}
 def _xml(org, mail, rid, begin, end, domain, p, rows):
     recs = []
     for ip, count, spf_raw, spf_dom, dkim_raw, dkim_dom in rows:
-        spf_eval = "pass" if spf_raw == "pass" and spf_dom.endswith(domain) else "fail"
+        spf_eval = "pass" if spf_raw == "pass" and spf_dom.replace("helo:", "").endswith(domain) else "fail"
         dkim_eval = "pass" if dkim_raw == "pass" and dkim_dom.endswith(domain) else "fail"
         passed = spf_eval == "pass" or dkim_eval == "pass"
         disp = "none" if passed or p == "none" else p
         dkim_xml = (f"<dkim><domain>{dkim_dom}</domain><selector>s1</selector><result>{dkim_raw}</result></dkim>"
                     if dkim_dom else "")
+        scope, env = ("helo", "") if spf_dom.startswith("helo:") else ("mfrom", spf_dom)
+        spf_dom = spf_dom.replace("helo:", "")
         recs.append(f"""<record><row><source_ip>{ip}</source_ip><count>{count}</count>
 <policy_evaluated><disposition>{disp}</disposition><dkim>{dkim_eval}</dkim><spf>{spf_eval}</spf></policy_evaluated></row>
-<identifiers><header_from>{domain}</header_from><envelope_from>{spf_dom}</envelope_from></identifiers>
-<auth_results>{dkim_xml}<spf><domain>{spf_dom}</domain><scope>mfrom</scope><result>{spf_raw}</result></spf></auth_results></record>""")
+<identifiers><header_from>{domain}</header_from><envelope_from>{env}</envelope_from></identifiers>
+<auth_results>{dkim_xml}<spf><domain>{spf_dom}</domain><scope>{scope}</scope><result>{spf_raw}</result></spf></auth_results></record>""")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <feedback><report_metadata><org_name>{org}</org_name><email>{mail}</email><report_id>{rid}</report_id>
 <date_range><begin>{begin}</begin><end>{end}</end></date_range></report_metadata>

@@ -6,6 +6,8 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+from . import advice
+
 # PTR の末尾から既知の送信サービスを推定する (表示とインサイト用のヒント)
 PROVIDERS = [
     ("google.com", "Google"), ("googleusercontent.com", "Google Cloud"),
@@ -53,6 +55,7 @@ OVERRIDE_LABELS = {
 # 失敗理由の分類コード → 一覧表示用の短いラベル
 FAILURE_LABELS = {
     "spf_misaligned": "SPF ドメイン不一致",
+    "spf_helo": "SPF: エラーメール/自動返信",
     "spf_fail": "SPF 失敗",
     "spf_none": "SPF 評価なし",
     "spf_error": "SPF エラー",
@@ -75,7 +78,8 @@ def failure_reasons(header_from: str, spf_eval: str, dkim_eval: str, spf, dkims,
                     aspf: str = "r", envelope_from: str = "") -> List[Dict]:
     """SPF / DKIM の生の認証結果とドメインの突き合わせから、DMARC 失敗の理由を推定する。
 
-    spf: (domain, result) または None / dkims: [(domain, result), ...]
+    spf: (domain, result, scope) または None。scope は mfrom / helo / 空 (記載なし)
+    dkims: [(domain, result), ...]
     DMARC に合格している (どちらかがアライメント込みで pass) 場合は空リスト。
     """
     if spf_eval == "pass" or dkim_eval == "pass":
@@ -89,21 +93,32 @@ def failure_reasons(header_from: str, spf_eval: str, dkim_eval: str, spf, dkims,
                                    if mode == "s" and org_domain(d) == org_domain(header_from) else "")
 
     # SPF
-    sd, sr = (spf or ("", "none"))
-    sd = sd or envelope_from
+    sd, sr, scope = (tuple(spf) + ("", "", ""))[:3] if spf else ("", "none", "")
+    sd = (sd or envelope_from or "").lower()
     sr = (sr or "none").lower()
-    if sr == "pass":
-        if _aligned(sd, header_from, aspf) is False:
-            add("spf_misaligned", f"SPF は {sd or '(不明)'} で合格しましたが、From ({header_from}) とドメインが一致しません"
-                + strict_note(aspf, sd))
-    elif sr in ("fail", "softfail", "neutral"):
-        add("spf_fail", f"送信元 IP が {sd or '(不明)'} の SPF レコードで許可されていません ({sr})")
-    elif sr == "permerror":
-        add("spf_error", f"{sd or '(不明)'} の SPF レコードに誤りがあります (構文誤り、または DNS 参照 10 回の上限超過)")
-    elif sr == "temperror":
-        add("spf_error", f"{sd or '(不明)'} の SPF 確認中に DNS の一時エラーが発生しました")
+    scope = (scope or "").lower()
+    if scope == "helo":
+        where = f"送信サーバー名 (HELO: {sd or '不明'})"
+    elif scope == "mfrom" or envelope_from:
+        where = f"Envelope From (Return-Path) のドメイン {sd or '(不明)'}"
     else:
-        add("spf_none", f"{sd or 'エンベロープ送信者'} に SPF レコードがない、または評価されていません")
+        where = sd or "(不明)"
+    if sr == "pass":
+        if not _aligned(sd, header_from, aspf):
+            if scope == "helo":
+                add("spf_helo", f"Envelope From が空のメール (エラーメール・自動返信など) のため、SPF は{where}で検査されて合格しましたが、"
+                                f"From ({header_from}) とドメインが一致しません")
+            else:
+                add("spf_misaligned", f"SPF は {where} で合格しましたが、From ({header_from}) とドメインが一致しません"
+                    + strict_note(aspf, sd))
+    elif sr in ("fail", "softfail", "neutral"):
+        add("spf_fail", f"送信元 IP が {where} の SPF レコードで許可されていません ({sr})")
+    elif sr == "permerror":
+        add("spf_error", f"{where} の SPF レコードに誤りがあります (構文誤り、または DNS 参照 10 回の上限超過)")
+    elif sr == "temperror":
+        add("spf_error", f"{where} の SPF 確認中に DNS の一時エラーが発生しました")
+    else:
+        add("spf_none", f"{where if sd else 'エンベロープ送信者'} に SPF レコードがない、または評価されていません")
 
     # DKIM
     sigs = [(d.lower(), (r or "").lower()) for d, r in dkims if d]
@@ -237,7 +252,7 @@ def dashboard(conn: sqlite3.Connection, domain: Optional[str] = None,
     src, dom_src = {}, defaultdict(dict)
     for row in conn.execute(f"""
         SELECT rp.domain, r.source_ip ip, r.count, r.dmarc_pass, r.spf_eval, r.dkim_eval, r.disposition,
-               r.header_from, r.envelope_from, r.spf_domain, r.spf_result, r.dkim_domains,
+               r.header_from, r.envelope_from, r.spf_domain, r.spf_result, r.spf_scope, r.dkim_domains,
                rp.adkim, rp.aspf, COALESCE(i.ptr, '') ptr
         FROM records r JOIN reports rp ON rp.id = r.report_pk
         LEFT JOIN ip_info i ON i.ip = r.source_ip{where}""", args):
@@ -256,8 +271,8 @@ def dashboard(conn: sqlite3.Connection, domain: Optional[str] = None,
         ins.extend(items)
     ins.sort(key=lambda o: SEVERITY_ORDER[o["severity"]])  # 安定ソート: 同じ重要度内はメッセージ数の多いドメイン順
     if not total:
-        ins = [{"severity": "info", "domain": None, "title": "データがありません",
-                "detail": "レポートを取り込むとここに診断結果が表示されます。"}]
+        ins = [{"severity": "info", "domain": None, "kind": "empty", "title": "データがありません",
+                "detail": "レポートを取り込むと、ここに診断結果が表示されます。", "why": "", "actions": [], "target": None}]
 
     reports = [dict(row) for row in conn.execute(f"""
         SELECT rp.id, rp.org_name, rp.report_id, rp.domain, rp.begin_ts, rp.end_ts, rp.p, rp.errors,
@@ -272,6 +287,7 @@ def dashboard(conn: sqlite3.Connection, domain: Optional[str] = None,
         "kpi": kpi, "daily": daily, "auth_matrix": auth_matrix, "reporters": reporters,
         "domains": domain_list, "sources": sources[:300], "reports": reports,
         "insights": ins,
+        "glossary": advice.GLOSSARY,
     }
 
 
@@ -285,7 +301,7 @@ def _accumulate(src: Dict, row) -> None:
     c = row["count"]
     if not row["dmarc_pass"]:
         for f in failure_reasons(row["header_from"], row["spf_eval"], row["dkim_eval"],
-                                 (row["spf_domain"], row["spf_result"]), _dkim_pairs(row["dkim_domains"]),
+                                 (row["spf_domain"], row["spf_result"], row["spf_scope"]), _dkim_pairs(row["dkim_domains"]),
                                  row["adkim"], row["aspf"], row["envelope_from"]):
             s["fail_reasons"][f["code"]] += c
     s["messages"] += c
@@ -311,11 +327,14 @@ def _finish_sources(src: Dict) -> List[Dict]:
         s = dict(s)
         s["fail"] = s["messages"] - s["pass"]
         s["pass_rate"] = _rate(s["pass"], s["messages"])
-        s["status"] = _source_status(s)
         for key in ("header_from", "spf_domains", "dkim_domains"):
             s[key] = sorted(s[key])
-        s["fail_reasons"] = [{"code": k, "label": FAILURE_LABELS[k], "messages": v}
-                             for k, v in sorted(s["fail_reasons"].items(), key=lambda kv: -kv[1])]
+        fr = [{"code": k, "label": FAILURE_LABELS[k], "messages": v, "help": advice.FAILURE_HELP[k]}
+              for k, v in sorted(s["fail_reasons"].items(), key=lambda kv: -kv[1])]
+        s["fail_reasons"] = fr
+        s["status"] = _source_status(s)
+        if s["status"] != "ok" and fr and fr[0]["code"] == "spf_helo" and fr[0]["messages"] >= s["fail"] * 0.5:
+            s["status"] = "bounce"  # 失敗の大半がエラーメール / 自動返信
         out.append(s)
     out.sort(key=lambda s: -s["messages"])
     return out
@@ -333,25 +352,41 @@ def _source_status(s: Dict) -> str:
 
 
 def record_details(conn: sqlite3.Connection, ip: str, domain: Optional[str] = None,
-                   start: Optional[int] = None, end: Optional[int] = None) -> List[Dict]:
+                   start: Optional[int] = None, end: Optional[int] = None) -> Dict:
+    """送信元 1 件の詳細: 総評 (状態・失敗理由ごとの説明と対策) と、レポートの行。"""
     where, args = _where(domain, start, end)
     where = (where + " AND " if where else " WHERE ") + "r.source_ip = ?"
+    src = {}
+    for row in conn.execute(f"""
+        SELECT r.source_ip ip, r.count, r.dmarc_pass, r.spf_eval, r.dkim_eval, r.disposition,
+               r.header_from, r.envelope_from, r.spf_domain, r.spf_result, r.spf_scope, r.dkim_domains,
+               rp.adkim, rp.aspf, COALESCE(i.ptr, '') ptr
+        FROM records r JOIN reports rp ON rp.id = r.report_pk
+        LEFT JOIN ip_info i ON i.ip = r.source_ip{where}""", args + [ip]):
+        _accumulate(src, row)
+    summary = _finish_sources(src)
+    summary = summary[0] if summary else None
+    if summary:
+        summary["status_help"] = advice.STATUS_HELP[summary["status"]]
+        summary["provider_hint"] = advice.provider_hint(summary["provider"]) if summary["fail"] else ""
+
     rows = conn.execute(f"""
         SELECT rp.org_name, rp.begin_ts, rp.end_ts, rp.domain, r.count, r.disposition, r.dkim_eval,
-               r.spf_eval, r.header_from, r.envelope_from, r.reasons, r.auth_json, rp.adkim, rp.aspf
+               r.spf_eval, r.header_from, r.envelope_from, r.spf_domain, r.spf_scope, r.reasons,
+               r.auth_json, rp.adkim, rp.aspf
         FROM records r JOIN reports rp ON rp.id = r.report_pk{where}
-        ORDER BY rp.begin_ts DESC LIMIT 500""", args + [ip])
+        ORDER BY r.dmarc_pass, rp.begin_ts DESC LIMIT 500""", args + [ip])  # 失敗した行を先に
     out = []
     for row in rows:
         d = dict(row)
         d["auth"] = json.loads(d.pop("auth_json") or "[]")
-        spf = next(((a["domain"], a["result"]) for a in d["auth"] if a["kind"] == "spf"), None)
+        spf = next(((a["domain"], a["result"], a.get("scope", "")) for a in d["auth"] if a["kind"] == "spf"), None)
         dkims = [(a["domain"], a["result"]) for a in d["auth"] if a["kind"] == "dkim"]
         d["failures"] = failure_reasons(d["header_from"], d["spf_eval"], d["dkim_eval"], spf, dkims,
                                         d.pop("adkim") or "r", d.pop("aspf") or "r", d["envelope_from"])
         d["overrides"] = override_reasons(d["reasons"])
         out.append(d)
-    return out
+    return {"summary": summary, "records": out}
 
 
 SEVERITY_ORDER = {"critical": 0, "serious": 1, "warning": 2, "good": 3, "info": 4}
@@ -359,81 +394,182 @@ SEVERITY_ORDER = {"critical": 0, "serious": 1, "warning": 2, "good": 3, "info": 
 
 def domain_insights(d: Dict, sources: List[Dict], daily: List[Dict], error_reports: int,
                     end: Optional[int]) -> List[Dict]:
-    """1 ドメイン分の状況から推奨アクションを生成する。
-    severity: critical / serious / warning / good / info"""
+    """1 ドメイン分の状況から、推奨アクションを生成する。
+
+    各項目: severity (critical / serious / warning / good / info), domain, kind, title,
+            detail (要約), why (理由), actions [{title, detail}], target (画面での参照先)
+    """
     out = []
     name = d["domain"]
 
-    def add(sev, title, detail):
-        out.append({"severity": sev, "domain": name, "title": title, "detail": detail})
+    def add(sev, kind, title, detail, why, actions, target=None):
+        out.append({"severity": sev, "domain": name, "kind": kind, "title": title, "detail": detail,
+                    "why": why, "actions": actions, "target": target})
 
     total = d["messages"]
     if not total:
         return out
     rate = d["pass"] / total
     p = d.get("p") or "none"
+    dmarc_txt = f"_dmarc.{name}"
+    step_find = {"title": "手順 1: 失敗している送信元を確認する",
+                 "detail": "下の「送信元」一覧を「失敗あり」で絞り込み、件数の多い順に、自社や委託先が使っているサービスかどうかを確認します。"
+                           "行をクリックすると、その送信元の失敗理由と対策が表示されます。"}
+
+    # ---- ポリシー ----
     if p == "none":
         if rate >= 0.98 and total >= 100:
-            add("good", "ポリシー強化を検討できます",
-                f"DMARC 合格率 {rate*100:.1f}% と安定しています。p=none から p=quarantine (まずは pct を段階的に) への引き上げを検討してください。")
+            add("good", "policy_ready", "ポリシーの強化を検討できます",
+                f"DMARC 合格率が {rate*100:.1f}% で安定しています。",
+                "今の p=none は「監視するだけ」の設定なので、なりすましメールも受信者に届いてしまいます。"
+                "正規のメールがほぼすべて合格している今なら、ポリシーを強めても正規のメールへの影響は小さいと考えられます。",
+                [{"title": "手順 1: まず一部のメールだけ迷惑メール扱いにする",
+                  "detail": f"DNS の {dmarc_txt} の TXT レコードを「v=DMARC1; p=quarantine; pct=25; rua=mailto:(今の宛先)」のように変更します。"
+                            "pct=25 は「失敗したメールの 25% だけに適用する」という意味で、影響を確かめながら進められます。"},
+                 {"title": "手順 2: 様子を見ながら広げる",
+                  "detail": "1〜2 週間ごとにこの画面で合格率を確認し、問題がなければ pct=50 → pct=100 と上げていきます。"},
+                 {"title": "手順 3: 最終的には reject (受信拒否) にする",
+                  "detail": "quarantine (pct=100) で問題が出なければ p=reject にします。なりすましメールを受信側で確実に止められるようになります。"},
+                 {"title": "注意",
+                  "detail": "変更する前に、「送信元」一覧の失敗している送信元に、自社や委託先のサービスが残っていないか確認してください。"
+                            "残っていると、強化した後はそのメールが迷惑メールフォルダに入るようになります。"}])
         else:
-            add("warning", "p=none のため、なりすましメールは素通りします",
-                f"合格率 {rate*100:.1f}%。「送信元」で失敗している正規の送信サービスを特定し、SPF/DKIM を整備してからポリシーを強化してください。")
-    elif p in ("quarantine", "reject") and rate < 0.95:
-        add("serious", f"p={p} で正規メールが隔離/拒否されている可能性",
-            f"合格率 {rate*100:.1f}%。失敗している送信元に社内・委託先のサービスが含まれていないか確認してください。")
+            add("warning", "policy_none", "p=none のため、なりすましメールは素通りします",
+                f"合格率は {rate*100:.1f}% です。失敗しているメールの中に、正規の送信元が残っています。",
+                "p=none は監視だけの設定で、DMARC に失敗したメールも普通に配信されます。"
+                "ただし、正規のメールが失敗している状態でポリシーを強めると、そのメールが届かなくなります。まず正規の送信元を直す必要があります。",
+                [step_find,
+                 {"title": "手順 2: 正規の送信元を直す",
+                  "detail": "「設定不備疑い」の送信元は、そのサービスで自社ドメインの DKIM を設定すれば合格するようになります。"
+                            "自社のサーバーなのに「なりすまし疑い」になっているものは、SPF への登録と DKIM 署名が必要です。"},
+                 {"title": "手順 3: 合格率 98% 以上を目安にポリシーを強化する",
+                  "detail": "正規の送信元が直ると合格率が上がります。安定すると、この診断が「ポリシーの強化を検討できます」に変わります。"}],
+                {"filter": "fail"})
+    elif rate < 0.95:
+        verb = "迷惑メールフォルダに入れられ" if p == "quarantine" else "受信を拒否され"
+        add("serious", "policy_blocking", f"p={p} の設定で、正規のメールが{'隔離' if p == 'quarantine' else '拒否'}されている可能性があります",
+            f"合格率は {rate*100:.1f}% です。",
+            f"p={p} では、DMARC に失敗したメールは受信側で{verb}ます。"
+            "失敗している送信元に自社や委託先のサービスが含まれていると、そのメールが相手に届いていない可能性があります。",
+            [step_find,
+             {"title": "手順 2: 正規の送信元なら、すぐに設定を直す",
+              "detail": "送信元の行をクリックすると、失敗の理由と対策が表示されます。多くの場合、送信サービスで自社ドメインの DKIM を設定すれば解決します。"},
+             {"title": "急ぎの場合: 一時的にポリシーを緩める",
+              "detail": f"業務への影響が大きい場合は、直すまでの間だけ {dmarc_txt} を p=none にする、または pct を小さくすることも検討してください。"
+                        "なりすまし対策は弱まるので、直したら元に戻します。"}],
+            {"filter": "fail"})
     if (d.get("pct") or 100) < 100:
-        add("info", f"pct={d['pct']} が設定されています",
-            "ポリシーは一部のメールにのみ適用されています。問題がなければ 100 に引き上げましょう。")
+        add("info", "pct", f"pct={d['pct']} が設定されています",
+            "ポリシーは、失敗したメールの一部にだけ適用されています。",
+            "pct はポリシーを段階的に導入するための設定です。適用されなかった残りのメールは、p=none と同じく普通に配信されます。",
+            [{"title": "問題がなければ 100 にする",
+              "detail": f"合格率が安定していれば、{dmarc_txt} の pct を 100 にする (または pct の記述を削除する) と、すべての失敗メールに適用されます。"}])
     if end is None and d.get("last_end") and d["last_end"] < time.time() - 4 * 86400:
-        add("warning", "直近 4 日以上レポートが届いていません",
-            "rua の宛先設定や取り込み処理 (IMAP 取得) が止まっていないか確認してください。")
+        last = time.strftime("%Y/%m/%d", time.localtime(d["last_end"]))
+        add("warning", "stale", "4 日以上レポートが届いていません",
+            f"最後に受け取ったレポートは {last} 分です。",
+            "通常、Google や Microsoft などからは毎日レポートが届きます。届かない場合は、DMARC の DNS 設定か、このシステムのメール取得が止まっている可能性があります。"
+            "(このドメインからメールをほとんど送っていない場合は、届かないのが正常なこともあります)",
+            [{"title": "確認 1: DMARC の DNS レコード",
+              "detail": f"{dmarc_txt} の TXT レコードが残っていて、rua=mailto: の宛先が正しいかを確認します。"},
+             {"title": "確認 2: レポート受信用のメールボックス",
+              "detail": "メールボックスにレポートが届いているか、容量オーバーや迷惑メールフォルダへの振り分けがないかを確認します。"},
+             {"title": "確認 3: このシステムの取り込み処理",
+              "detail": "サーバーで「journalctl -u dmarc-dashboard」を実行し、IMAP 取得のエラーが出ていないかを確認します。"}])
 
+    # ---- 送信元 ----
     threshold = max(10, total * 0.005)
     mis = [s for s in sources if s["status"] == "misaligned" and s["fail"] >= threshold]
     for s in mis[:5]:
         label = s["provider"] or s["ptr"] or s["ip"]
         own = {org_domain(h) for h in s["header_from"]}
-        foreign_spf = [x for x in s["spf_domains"] if org_domain(x) not in own]
-        foreign_dkim = [x for x in s["dkim_domains"] if org_domain(x) not in own]
-        hints = []
-        if s["spf_raw_pass"] > s["spf_aligned"] and foreign_spf:
-            hints.append(f"SPF は {', '.join(foreign_spf[:3])} で合格しているが From ドメインと不一致 (Return-Path を自ドメインに設定)")
-        if s["dkim_raw_pass"] > s["dkim_aligned"] and foreign_dkim:
-            hints.append(f"DKIM 署名ドメインが {', '.join(foreign_dkim[:3])} (自ドメインでの DKIM 署名を設定)")
-        add("serious", f"{label}: 認証は通るがアラインメント失敗 ({s['fail']:,} 通)",
-            "正規の送信サービスの設定不備の可能性が高いです。" + " / ".join(hints))
+        foreign = sorted({x for x in s["spf_domains"] + s["dkim_domains"] if org_domain(x) not in own})
+        hint = advice.provider_hint(s["provider"])
+        dkim_fix = advice.FAILURE_HELP["dkim_misaligned"]["actions"][0]["detail"]
+        actions = [
+            {"title": "対策 1 (おすすめ): 自社ドメインで DKIM 署名する",
+             "detail": (hint + " " if hint else "") + dkim_fix},
+            advice.FAILURE_HELP["spf_misaligned"]["actions"][1],
+            advice.FAILURE_HELP["spf_misaligned"]["actions"][2],
+        ]
+        add("serious", "source_misaligned", f"{label}: 認証は通っているのに、ドメインが一致していません ({s['fail']:,} 通)",
+            f"送信元 {s['ip']} ({s['ptr'] or '逆引きなし'}) からの {s['fail']:,} 通が DMARC に失敗しています。",
+            advice.STATUS_HELP["misaligned"] +
+            (f"このサービスは、SPF / DKIM の認証に {', '.join(foreign[:3])} のドメインを使っているため、From の {name} としては合格になりません。" if foreign else ""),
+            actions, {"ip": s["ip"]})
+
+    bounce = [s for s in sources if s["status"] == "bounce" and s["fail"] >= threshold]
+    for s in bounce[:3]:
+        label = s["provider"] or s["ptr"] or s["ip"]
+        h = advice.FAILURE_HELP["spf_helo"]
+        add("warning", "source_bounce", f"{label}: エラーメール・自動返信が DMARC に失敗しています ({s['fail']:,} 通)",
+            f"送信元 {s['ip']} ({s['ptr'] or '逆引きなし'}) からの、Envelope From が空のメールです。",
+            h["what"] + h["why"], h["actions"], {"ip": s["ip"]})
 
     unauth = [s for s in sources if s["status"] == "unauthenticated"]
     unauth_msgs = sum(s["messages"] for s in unauth)
     if unauth_msgs:
         big = [s for s in unauth if s["messages"] >= threshold]
-        sev = "critical" if unauth_msgs >= total * 0.05 else "warning"
-        add(sev, f"SPF/DKIM とも失敗している送信元: {len(unauth)} 件 ({unauth_msgs:,} 通)",
-            "なりすまし、または未設定の送信元です。" +
-            ("主な送信元: " + ", ".join(s["ptr"] or s["ip"] for s in big[:5]) + "。" if big else "") +
-            "心当たりのないものはポリシー強化で遮断できます。")
+        if p == "reject":
+            sev, tail = "info", "すでに p=reject なので、これらのメールは受信側で拒否されています。自社の送信元でなければ、対応は不要です。"
+        elif p == "quarantine":
+            sev, tail = "warning", "p=quarantine なので、これらのメールは受信側で迷惑メール扱いになっています。なりすましを確実に止めるには、p=reject への強化を検討してください。"
+        else:
+            sev = "critical" if unauth_msgs >= total * 0.05 else "warning"
+            tail = "今は p=none なので、これらのメールは受信者に普通に届いています。"
+        add(sev, "source_unauth", f"SPF も DKIM も通っていない送信元が {len(unauth)} 件あります ({unauth_msgs:,} 通)",
+            ("主な送信元: " + ", ".join(s["ptr"] or s["ip"] for s in big[:5]) + "。" if big else "") + tail,
+            advice.STATUS_HELP["unauthenticated"] +
+            "受信者には自社のドメインから届いたように見えるため、フィッシング詐欺などに悪用されるおそれがあります。",
+            [{"title": "判断: 送信元を 1 つずつ確認する",
+              "detail": "「送信元」一覧を「なりすまし疑い」で絞り込み、ホスト名 (PTR) から、自社や委託先のサーバーかどうかを確認します。"},
+             {"title": "自社のサーバーだった場合",
+              "detail": "SPF レコードへの追加と DKIM 署名の設定が必要です。送信元の行をクリックすると、詳しい手順が表示されます。"},
+             {"title": "心当たりがない場合 (なりすまし)",
+              "detail": "送信元を直接止めることはできませんが、受信側で止めてもらえます。正規の送信元をすべて直したうえで、"
+                        f"{dmarc_txt} のポリシーを quarantine → reject と強化してください。SPF に追加してはいけません。"}],
+            {"filter": "unauthenticated"})
 
     fwd = [s for s in sources if s["dkim_aligned"] and not s["spf_aligned"] and s["pass"] == s["messages"]]
     if fwd:
-        add("info", f"DKIM のみで合格している送信元: {len(fwd)} 件",
-            "転送やメーリングリスト経由の典型パターンです。DKIM が維持されていれば問題ありません。")
+        add("info", "dkim_only", f"DKIM だけで合格している送信元が {len(fwd)} 件あります",
+            "転送やメーリングリスト経由のメールによく見られるパターンです。",
+            "メールが転送されると、転送サーバーの IP で SPF が検査されるため、SPF は失敗します。"
+            "DKIM の署名は転送されても残るので、DMARC には合格できています。",
+            [{"title": "対応は不要です",
+              "detail": "DKIM が合格していれば問題ありません。このように SPF が使えない場面があるため、すべての送信元で DKIM 署名を設定しておくことが大切です。"}])
 
+    # ---- 推移・レポート ----
     if len(daily) >= 14:
         def r(rows):
             t = sum(x["pass"] + x["fail"] for x in rows)
             return (sum(x["pass"] for x in rows) / t) if t else None
         cur, prev = r(daily[-7:]), r(daily[-14:-7])
         if cur is not None and prev is not None and prev - cur >= 0.05:
-            add("serious", "直近 7 日で合格率が低下しています",
-                f"{prev*100:.1f}% → {cur*100:.1f}%。新しい送信サービスの追加や DNS 変更がなかったか確認してください。")
+            add("serious", "rate_drop", "直近 7 日で合格率が下がっています",
+                f"{prev*100:.1f}% → {cur*100:.1f}% に下がりました。",
+                "新しく使い始めた配信サービス、DNS (SPF / DKIM) の変更や削除、なりすましの増加などで、合格率は下がります。",
+                [{"title": "確認 1: 最近増えた送信元",
+                  "detail": "画面上部の期間を「7日」にして「送信元」一覧を見ると、最近失敗している送信元が分かります。"},
+                 {"title": "確認 2: DNS の変更",
+                  "detail": "最近 SPF や DKIM の DNS レコードを変更・削除していないかを、DNS の管理者に確認します。"}],
+                {"filter": "fail"})
 
     if error_reports:
-        add("info", f"エラー付きのレポート: {error_reports} 件",
-            "レポーターが DNS レコードの取得等でエラーを報告しています。レポート一覧で内容を確認できます。")
+        add("info", "report_errors", f"エラー付きのレポートが {error_reports} 件あります",
+            "受信側が、レポートにエラーを書き添えています。",
+            "受信側が DMARC レコードの読み取りなどで問題を見つけると、レポートにエラーを書き添えることがあります。",
+            [{"title": "内容を確認する",
+              "detail": f"「受信したレポート」一覧の「エラー」欄で内容を確認してください。同じエラーが続く場合は、{dmarc_txt} の TXT レコードの書き方を見直します。"}])
 
     if rate >= 0.99 and not any(o["severity"] in ("critical", "serious", "good") for o in out):
-        add("good", "認証状況は良好です", f"DMARC 合格率は {rate*100:.1f}% です。")
+        nxt = ({"title": "次のステップ: reject まで強化する",
+                "detail": f"{dmarc_txt} を p=reject にすると、なりすましメールを受信側で確実に拒否できます。"}
+               if p != "reject" else
+               {"title": "引き続き監視する",
+                "detail": "新しい配信サービスを使い始めたときは、ここでそのメールが合格しているかを確認してください。"})
+        add("good", "healthy", "認証状況は良好です", f"DMARC 合格率は {rate*100:.1f}% です。",
+            "正規のメールのほとんどが DMARC に合格しています。", [nxt])
 
     out.sort(key=lambda o: SEVERITY_ORDER[o["severity"]])
     return out

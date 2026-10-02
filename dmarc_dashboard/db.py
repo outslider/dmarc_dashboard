@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS records (
     dkim_result   TEXT,  -- 最初の DKIM 署名の生結果
     spf_domain    TEXT,
     spf_result    TEXT,  -- 生の SPF 結果
+    spf_scope     TEXT,  -- mfrom (Envelope From) / helo (HELO 名) / 空 (レポートに記載なし)
     auth_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_records_report ON records (report_pk);
@@ -60,7 +61,23 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(records)")}
+    if "spf_scope" not in cols:
+        # v1 → v2: SPF の scope 列を追加し、保存済みの認証結果 (auth_json) から埋める
+        with conn:
+            conn.execute("ALTER TABLE records ADD COLUMN spf_scope TEXT")
+            rows = [(_spf_scope(json.loads(a or "[]")), i)
+                    for i, a in conn.execute("SELECT id, auth_json FROM records")]
+            conn.executemany("UPDATE records SET spf_scope = ? WHERE id = ?", rows)
+
+
+def _spf_scope(auth) -> str:
+    return next(((a.get("scope") or "").lower() for a in auth if a.get("kind") == "spf"), "")
 
 
 def save_report(conn: sqlite3.Connection, report: Report, source: str = "") -> bool:
@@ -89,14 +106,15 @@ def save_report(conn: sqlite3.Connection, report: Report, source: str = "") -> b
                 dkims[0].result if dkims else "none",
                 spfs[0].domain if spfs else "",
                 spfs[0].result if spfs else "none",
+                (spfs[0].scope or "").lower() if spfs else "",
                 json.dumps([a.__dict__ for a in r.auth_results], ensure_ascii=False),
             ))
         conn.executemany(
             """INSERT INTO records
                (report_pk, source_ip, count, disposition, dkim_eval, spf_eval, dmarc_pass,
                 header_from, envelope_from, envelope_to, reasons, dkim_domains, dkim_result,
-                spf_domain, spf_result, auth_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                spf_domain, spf_result, spf_scope, auth_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows,
         )
     return True

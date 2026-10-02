@@ -114,7 +114,7 @@ class StoreAndAnalyticsTest(unittest.TestCase):
         self.assertEqual(by_ip["192.0.2.1"]["status"], "ok")
         self.assertEqual(by_ip["198.51.100.1"]["status"], "misaligned")
         titles = " ".join(i["title"] for i in d["insights"])
-        self.assertIn("アラインメント失敗", titles)
+        self.assertIn("ドメインが一致していません", titles)
         self.assertIn("p=none", titles)
         # 期間フィルタ
         self.assertEqual(analytics.dashboard(self.conn, start=1800000000)["kpi"]["messages"], 0)
@@ -134,7 +134,7 @@ class StoreAndAnalyticsTest(unittest.TestCase):
         self.assertEqual(by_dom["example-hd.co.jp"]["issues"], {"critical": 0, "serious": 0, "warning": 0})
         self.assertEqual(len(by_dom["example.co.jp"]["daily"]), 1)
         # 送信元の診断も、問題のあるドメインにだけ付く
-        mis = [i for i in d["insights"] if "アラインメント失敗" in i["title"]]
+        mis = [i for i in d["insights"] if "ドメインが一致していません" in i["title"]]
         self.assertEqual([i["domain"] for i in mis], ["example.co.jp"])
         self.assertTrue(all(i["domain"] for i in d["insights"]))
 
@@ -160,13 +160,43 @@ class StoreAndAnalyticsTest(unittest.TestCase):
         self.assertIn("厳格", strict[0]["detail"])
         self.assertEqual(codes(hf, "fail", "fail", ("mail.example.co.jp", "pass"), [("mail.example.co.jp", "pass")]), ["other"])
 
+    def test_failure_reasons_scope(self):
+        fr = analytics.failure_reasons
+        hf = "example-life.co.jp"
+        mfrom = fr(hf, "fail", "fail", ("example.co.jp", "pass", "mfrom"), [])
+        self.assertEqual(mfrom[0]["code"], "spf_misaligned")
+        self.assertIn("Envelope From", mfrom[0]["detail"])
+        helo = fr(hf, "fail", "fail", ("mail.example.co.jp", "pass", "helo"), [], envelope_from="")
+        self.assertEqual(helo[0]["code"], "spf_helo")
+        self.assertIn("HELO", helo[0]["detail"])
+        # scope の記載がないレポート
+        self.assertEqual(fr(hf, "fail", "fail", ("example.co.jp", "pass"), [])[0]["code"], "spf_misaligned")
+
+    def test_insights_have_actions_and_policy_aware_severity(self):
+        ingest.import_bytes(self.conn, XML, "a.xml")
+        d = analytics.dashboard(self.conn, end=2_000_000_000)
+        for i in d["insights"]:
+            self.assertTrue(i["why"] and i["actions"], i["title"])
+            self.assertTrue(all(a["title"] and a["detail"] for a in i["actions"]))
+        self.assertTrue(d["glossary"])
+        dom = {"domain": "x.example", "messages": 1000, "pass": 900, "p": "reject", "pct": 100}
+        spoof = [{"status": "unauthenticated", "messages": 100, "fail": 100, "pass": 0, "ip": "203.0.113.1",
+                  "ptr": "", "dkim_aligned": 0, "spf_aligned": 0}]
+        sev = lambda p: next(i["severity"] for i in analytics.domain_insights(dict(dom, p=p), spoof, [], 0, 1)
+                             if i["kind"] == "source_unauth")
+        self.assertEqual((sev("reject"), sev("quarantine"), sev("none")), ("info", "warning", "critical"))
+
     def test_failure_reasons_in_dashboard(self):
         ingest.import_bytes(self.conn, XML, "a.xml")
         src = {x["ip"]: x for x in analytics.dashboard(self.conn)["sources"]}
         self.assertEqual([f["code"] for f in src["198.51.100.1"]["fail_reasons"]],
                          ["spf_misaligned", "dkim_misaligned"])
         self.assertEqual(src["192.0.2.1"]["fail_reasons"], [])
-        rec = analytics.record_details(self.conn, "198.51.100.1")[0]
+        det = analytics.record_details(self.conn, "198.51.100.1")
+        self.assertEqual(det["summary"]["status"], "misaligned")
+        self.assertTrue(det["summary"]["status_help"])
+        self.assertTrue(all(f["help"]["actions"] for f in det["summary"]["fail_reasons"]))
+        rec = det["records"][0]
         self.assertEqual(rec["overrides"], ["転送メールと判断 (forwarded): x"])
         self.assertEqual(len(rec["failures"]), 2)
 
@@ -212,8 +242,9 @@ class ServerTest(unittest.TestCase):
         d = json.load(self.req("/api/dashboard"))
         self.assertEqual(d["kpi"]["messages"], 60)
         self.assertEqual(d["all_domains"], ["example.co.jp"])
-        rows = json.load(self.req("/api/source?ip=198.51.100.1"))
-        self.assertEqual(rows[0]["count"], 50)
+        res = json.load(self.req("/api/source?ip=198.51.100.1"))
+        self.assertEqual(res["records"][0]["count"], 50)
+        self.assertEqual(res["summary"]["status"], "misaligned")
 
     def test_base_path(self):
         # プレフィックス付き (ProxyPass で /dmarc_dashboard/ を残して転送する構成)

@@ -10,6 +10,7 @@ const STATUS = {
   ok: { label: "正常", c: "var(--good)", ic: "✓" },
   partial: { label: "一部失敗", c: "var(--warning)", ic: "!" },
   misaligned: { label: "設定不備疑い", c: "var(--serious)", ic: "!" },
+  bounce: { label: "エラーメール/自動返信", c: "var(--warning)", ic: "!" },
   unauthenticated: { label: "なりすまし疑い", c: "var(--critical)", ic: "✕" },
 };
 const SEVERITY = {
@@ -21,6 +22,8 @@ const SEVERITY = {
 };
 
 const state = { days: 30, from: "", to: "", domain: "", srcFilter: "" };
+// 診断の表示状態 (画面の中だけで保持)
+const insView = { hidden: new Set(["info"]), groupOpen: new Map(), expandAll: false };
 let data = null;
 
 // ---------- DOM helpers (データ由来の文字列は必ず textContent で入れる) ----------
@@ -293,14 +296,8 @@ function render() {
   sel.value = cur;
   $("#fetch-btn").hidden = !d.imap_enabled;
 
-  $("#insights").replaceChildren(...d.insights.map((i) => {
-    const sv = SEVERITY[i.severity];
-    const dom = i.domain && !state.domain
-      ? el("button", { class: "pill link", title: `${i.domain} で絞り込む`, onclick: () => selectDomain(i.domain) }, i.domain)
-      : null;
-    return el("li", {}, el("span", { class: "badge", style: `--c:${sv.c}` }, sv.label),
-      el("span", { class: "t" }, dom, dom ? " " : null, i.title), el("span", { class: "d" }, i.detail));
-  }));
+  renderInsights();
+  $("#glossary").replaceChildren(...(d.glossary || []).flatMap(([t, desc]) => [el("dt", {}, t), el("dd", {}, desc)]));
 
   columnChart($("#chart-daily"), d.daily);
   lineChart($("#chart-rate"), d.daily);
@@ -357,6 +354,91 @@ function render() {
   ], d.reports);
 }
 
+// ---------- 診断と推奨アクション ----------
+const SEV_KEYS = ["critical", "serious", "warning", "good", "info"];
+function renderInsights() {
+  const all = data.insights;
+  const counts = Object.fromEntries(SEV_KEYS.map((k) => [k, all.filter((i) => i.severity === k).length]));
+  $("#ins-filter").replaceChildren(...SEV_KEYS.filter((k) => counts[k]).map((k) => el("button", {
+    class: insView.hidden.has(k) ? "" : "on", "aria-pressed": String(!insView.hidden.has(k)),
+    onclick: () => { insView.hidden.has(k) ? insView.hidden.delete(k) : insView.hidden.add(k); renderInsights(); },
+  }, el("span", { class: "badge", style: `--c:${SEVERITY[k].c}` }, `${SEVERITY[k].label} ${counts[k]}`))));
+  $("#ins-expand").textContent = insView.expandAll ? "すべて閉じる" : "すべて開く";
+
+  const shown = all.filter((i) => !insView.hidden.has(i.severity));
+  const hiddenN = all.length - shown.length;
+  const host = $("#insights");
+  host.replaceChildren();
+  if (!shown.length) {
+    host.append(el("p", { class: "dim" }, hiddenN ? `表示する項目がありません (${hiddenN} 件は非表示)` : "診断項目はありません"));
+    return;
+  }
+  const domains = [...new Set(shown.map((i) => i.domain))];
+  if (state.domain || domains.length <= 1) {
+    host.append(el("ul", { class: "insights" }, shown.map((i) => insightItem(i, false))));
+  } else {
+    // ドメインごとにまとめる。重大・要対応のあるドメインは最初から開いておく
+    const rank = (dm) => Math.min(...shown.filter((i) => i.domain === dm).map((i) => SEV_KEYS.indexOf(i.severity)));
+    domains.sort((a, b) => rank(a) - rank(b));
+    for (const dm of domains) {
+      const items = shown.filter((i) => i.domain === dm);
+      const c = Object.fromEntries(SEV_KEYS.map((k) => [k, items.filter((i) => i.severity === k).length]));
+      const open = insView.expandAll || (insView.groupOpen.has(dm) ? insView.groupOpen.get(dm) : rank(dm) <= 1);
+      const g = el("details", { class: "ins-group", open },
+        el("summary", {},
+          el("span", { class: "g-name" }, dm),
+          el("span", { class: "issues" }, SEV_KEYS.filter((k) => c[k]).map((k) =>
+            el("span", { class: "badge", style: `--c:${SEVERITY[k].c}` }, `${SEVERITY[k].label} ${c[k]}`))),
+          el("button", { class: "btn small ghost g-go", onclick: (e) => { e.preventDefault(); selectDomain(dm); } }, "このドメインを表示")),
+        el("ul", { class: "insights" }, items.map((i) => insightItem(i, true))));
+      g.addEventListener("toggle", () => insView.groupOpen.set(dm, g.open));
+      host.append(g);
+    }
+  }
+  if (hiddenN) {
+    host.append(el("p", { class: "note hidden-note" }, `${hiddenN} 件を非表示にしています (上の重要度ボタンで切り替えられます)`));
+  }
+}
+
+function insightItem(i, grouped) {
+  const sv = SEVERITY[i.severity];
+  const dom = i.domain && !state.domain && !grouped
+    ? el("button", { class: "pill link", title: `${i.domain} で絞り込む`, onclick: (e) => { e.preventDefault(); selectDomain(i.domain); } }, i.domain)
+    : null;
+  const body = el("div", { class: "ins-body" });
+  if (i.why) body.append(el("h4", {}, "なぜ？"), el("p", {}, i.why));
+  if (i.actions && i.actions.length) {
+    body.append(el("h4", {}, "対策"), el("ul", { class: "actions" },
+      i.actions.map((a) => el("li", {}, el("b", {}, a.title), el("p", {}, a.detail)))));
+  }
+  if (i.target) {
+    body.append(el("button", { class: "btn small", onclick: () => goTarget(i) },
+      i.target.ip ? "この送信元の詳細を見る" : "該当する送信元を一覧で見る"));
+  }
+  return el("li", {}, el("details", { class: "ins-item", open: insView.expandAll },
+    el("summary", {},
+      el("span", { class: "badge", style: `--c:${sv.c}` }, sv.label),
+      el("span", { class: "t" }, dom, dom ? " " : null, i.title),
+      el("span", { class: "d" }, i.detail)),
+    body));
+}
+
+async function goTarget(i) {
+  if (i.target.ip) {
+    const src = data.sources.find((s) => s.ip === i.target.ip) || { ip: i.target.ip, ptr: "" };
+    return openDetail(src, i.domain);
+  }
+  state.srcFilter = i.target.filter || "";
+  if (i.domain && state.domain !== i.domain) {
+    state.domain = i.domain;
+    await load();
+  } else {
+    renderSources();
+  }
+  document.querySelectorAll("#src-filter button").forEach((x) => x.classList.toggle("on", x.dataset.f === state.srcFilter));
+  $("#tbl-sources").closest("section").scrollIntoView({ behavior: "smooth" });
+}
+
 function renderSources() {
   const f = state.srcFilter;
   const rows = data.sources.filter((s) => !f || (f === "fail" ? s.fail > 0 : s.status === f));
@@ -387,29 +469,73 @@ function failSummary(r) {
 function failDetail(r) {
   const items = [];
   if (!r.failures.length) items.push(el("div", { class: "res-pass" }, "DMARC 合格"));
-  for (const f of r.failures) items.push(el("div", {}, el("b", {}, f.label), el("span", { class: "dim" }, ` ${f.detail}`)));
+  for (const f of r.failures) items.push(el("div", { title: f.detail }, el("b", {}, f.label), el("span", { class: "dim" }, ` ${f.detail}`)));
   for (const o of r.overrides) items.push(el("div", {}, el("b", {}, "受信側の判断"), el("span", { class: "dim" }, ` ${o}`)));
   return el("div", { class: "reason-list" }, items);
 }
 
-async function openDetail(src) {
+// Envelope From が空の行は、SPF の検査対象ドメインと、そうなっている理由を表示する
+function envFrom(r) {
+  if (r.envelope_from) return r.envelope_from;
+  if (r.spf_scope === "helo") {
+    return el("span", {}, el("span", { class: "pill" }, "空 (エラーメール/自動返信)"), el("br"),
+      el("span", { class: "dim" }, `HELO: ${r.spf_domain || "不明"}`));
+  }
+  return el("span", { class: "dim", title: "レポーターがこの項目を記載していません。SPF の検査対象ドメインを表示しています" },
+    r.spf_domain ? `記載なし (SPF: ${r.spf_domain})` : "記載なし");
+}
+
+function helpBlock(h) {
+  return el("div", { class: "help" },
+    el("p", {}, h.what),
+    el("h4", {}, "なぜ？"), el("p", {}, h.why),
+    el("h4", {}, "対策"), el("ul", { class: "actions" },
+      h.actions.map((a) => el("li", {}, el("b", {}, a.title), el("p", {}, a.detail)))));
+}
+
+function detailSummary(sm) {
+  const host = $("#detail-summary");
+  host.replaceChildren();
+  if (!sm) return;
+  host.append(el("div", { class: "sum-head" },
+    badge(STATUS[sm.status]),
+    el("span", {}, `${fmt(sm.messages)} 通中 ${fmt(sm.fail)} 通が DMARC に失敗 (合格率 ${pct(sm.pass_rate)})`)));
+  host.append(el("p", { class: "sum-text" }, sm.status_help));
+  if (sm.provider_hint) {
+    host.append(el("div", { class: "hint" }, el("b", {}, `${sm.provider} での設定方法: `), sm.provider_hint));
+  }
+  if (sm.fail_reasons.length) {
+    host.append(el("h3", { class: "sub-h" }, "失敗の理由と対策"));
+    sm.fail_reasons.forEach((f, idx) => {
+      host.append(el("details", { class: "reason-card", open: idx === 0 },
+        el("summary", {}, el("b", {}, f.label), el("span", { class: "dim" }, ` ${fmt(f.messages)} 通`)),
+        helpBlock(f.help)));
+    });
+  }
+}
+
+async function openDetail(src, domainOverride) {
   $("#detail-title").textContent = `${src.ip}  ${src.ptr || ""}`;
-  const rows = await api(`api/source?${params({ ip: src.ip })}`);
+  const extra = { ip: src.ip };
+  if (domainOverride) extra.domain = domainOverride;
+  const det = await api(`api/source?${params(extra)}`);
+  detailSummary(det.summary);
   const res = (v) => el("span", { class: v === "pass" ? "res-pass" : v === "none" ? "dim" : "res-fail" }, v);
   table("#tbl-detail", [
     { label: "期間", render: (r) => `${dateStr(r.begin_ts)}` },
     { label: "レポーター", render: (r) => r.org_name },
     { label: "From", render: (r) => r.header_from },
-    { label: "Envelope From", render: (r) => r.envelope_from || "–" },
+    { label: "Envelope From", render: (r) => envFrom(r) },
     { label: "件数", num: 1, render: (r) => fmt(r.count) },
     { label: "処置", render: (r) => r.disposition },
     { label: "SPF (整合)", render: (r) => res(r.spf_eval) },
     { label: "DKIM (整合)", render: (r) => res(r.dkim_eval) },
     { label: "失敗理由", cls: "wrap reasons", render: (r) => failDetail(r) },
     { label: "認証結果 (生)", cls: "wrap", render: (r) => el("span", {}, r.auth.map((a, i) => el("span", {},
-      i ? " · " : "", `${a.kind.toUpperCase()} ${a.domain}${a.selector ? ` (${a.selector})` : ""}: `, res(a.result)))) },
-  ], rows);
+      i ? " · " : "", `${a.kind.toUpperCase()} ${a.domain}${a.selector ? ` (${a.selector})` : ""}${a.scope ? ` [${a.scope}]` : ""}: `, res(a.result)))) },
+  ], det.records);
   $("#detail").showModal();
+  $("#detail").scrollTop = 0;
 }
 
 // ---------- data loading ----------
@@ -528,6 +654,11 @@ $("#fetch-btn").addEventListener("click", async () => {
   } catch (e) { toast(`取得に失敗しました: ${e.message}`); } finally { b.disabled = false; }
 });
 $("#detail-close").addEventListener("click", () => $("#detail").close());
+$("#ins-expand").addEventListener("click", () => {
+  insView.expandAll = !insView.expandAll;
+  insView.groupOpen.clear();
+  renderInsights();
+});
 
 let dragDepth = 0;
 window.addEventListener("dragenter", (e) => { e.preventDefault(); dragDepth++; $("#drop").classList.add("show"); });
