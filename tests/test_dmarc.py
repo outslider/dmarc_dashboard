@@ -200,6 +200,18 @@ class StoreAndAnalyticsTest(unittest.TestCase):
         self.assertEqual(rec["overrides"], ["転送メールと判断 (forwarded): x"])
         self.assertEqual(len(rec["failures"]), 2)
 
+    def test_delete_domains_keeps_others(self):
+        ingest.import_bytes(self.conn, XML, "a.xml")  # example.co.jp
+        real = (XML.replace(b"Example.co.jp", b"real.example.jp").replace(b"example.co.jp", b"real.example.jp")
+                .replace(b"<report_id>123456", b"<report_id>777"))
+        ingest.import_bytes(self.conn, real, "b.xml")
+        db.save_ptr(self.conn, "192.0.2.1", "x.example")
+        self.assertEqual(db.delete_domains(self.conn, ["Example.co.jp"]), 1)
+        self.assertEqual(analytics.domains(self.conn), ["real.example.jp"])
+        # 行は CASCADE で消え、まだ使われている IP の逆引きは残る
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0], 2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM ip_info").fetchone()[0], 1)
+
     def test_org_domain(self):
         self.assertEqual(analytics.org_domain("mail.shop.example.co.jp"), "example.co.jp")
         self.assertEqual(analytics.org_domain("bounce.example.com"), "example.com")

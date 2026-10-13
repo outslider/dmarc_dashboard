@@ -5,7 +5,8 @@
   folders            IMAP のフォルダ一覧を表示する (接続確認にも)
   resolve            送信元 IP の逆引き (PTR) を更新する
   serve              ダッシュボードを起動する
-  demo               サンプルデータを生成して取り込む
+  demo               サンプルデータを生成して取り込む (既定では別の DB: data/demo.sqlite3)
+  delete-domain      指定したドメインのデータを削除する (--demo でサンプルデータを削除)
 """
 
 import argparse
@@ -31,6 +32,7 @@ def load_config(path):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="dmarc_dashboard", description="DMARC レポート分析ダッシュボード")
     ap.add_argument("-c", "--config", default="config.ini", help="設定ファイル (既定: config.ini)")
+    ap.add_argument("--db", help="使う DB ファイル (config.ini の [database] path より優先)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("import", help="ファイル / ディレクトリを取り込む")
@@ -42,13 +44,22 @@ def main(argv=None):
     p.add_argument("--host")
     p.add_argument("--port", type=int)
     p.add_argument("--fetch-interval", type=int, default=0, help="IMAP を自動取得する間隔 (秒)")
-    p = sub.add_parser("demo", help="サンプルデータを生成して取り込む")
+    p = sub.add_parser("demo", help="サンプルデータを生成して取り込む (既定の DB は data/demo.sqlite3)")
     p.add_argument("--dir", default="data/sample")
+    p = sub.add_parser("delete-domain", help="指定したドメインのデータを削除する")
+    p.add_argument("domains", nargs="*", help="削除するドメイン (例: example.co.jp)")
+    p.add_argument("--demo", action="store_true", help="demo コマンドで作ったサンプルドメインを削除する")
+    p.add_argument("-y", "--yes", action="store_true", help="確認せずに削除する")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config(args.config)
+    if args.db:
+        cfg.set("database", "path", args.db)
+    elif args.cmd == "demo":
+        # サンプルデータが本番の DB に混ざらないよう、demo は既定で別の DB に書き込む
+        cfg.set("database", "path", "data/demo.sqlite3")
     db_path = cfg.get("database", "path", fallback="data/dmarc.sqlite3")
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     resolve = cfg.getboolean("dns", "resolve", fallback=True)
@@ -72,13 +83,30 @@ def main(argv=None):
     elif args.cmd == "resolve":
         print(f"{ingest.resolve_ptrs(conn)} 件の IP を逆引きしました")
         return
+    elif args.cmd == "delete-domain":
+        targets = list(args.domains) + (list(sample.PROFILES) if args.demo else [])
+        if not targets:
+            sys.exit("削除するドメインを指定してください (サンプルデータなら --demo)")
+        found = db.domain_counts(conn, targets)
+        if not found:
+            print(f"{db_path} に該当するデータはありません: {', '.join(targets)}")
+            return
+        print(f"DB: {db_path}")
+        for dom, n in found:
+            print(f"  {dom}: レポート {n} 件")
+        if not args.yes and input("これらのデータを削除します。よろしいですか? [y/N] ").strip().lower() != "y":
+            print("中止しました")
+            return
+        print(f"レポート {db.delete_domains(conn, [d for d, _ in found])} 件を削除しました")
+        return
     elif args.cmd == "demo":
         n = sample.generate(args.dir)
         stats = ingest.import_paths(conn, [args.dir])
         for ip, ptr in sample.PTRS.items():  # デモ用 IP は実在しないので PTR を直接登録
             db.save_ptr(conn, ip, ptr)
         resolve = False
-        print(f"サンプル {n} ファイルを生成しました ({args.dir})")
+        print(f"サンプル {n} ファイルを生成しました ({args.dir}) → DB: {db_path}")
+        print(f"サンプルを表示するには: python3 -m dmarc_dashboard --db {db_path} serve")
     print(stats)
     for e in stats.errors[:50]:
         print("  -", e)

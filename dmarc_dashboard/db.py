@@ -120,6 +120,26 @@ def save_report(conn: sqlite3.Connection, report: Report, source: str = "") -> b
     return True
 
 
+def delete_domains(conn: sqlite3.Connection, domains: Iterable[str]) -> int:
+    """指定ドメインのレポート (と、その行) を削除する。削除したレポート数を返す。"""
+    domains = [d.lower() for d in domains]
+    if not domains:
+        return 0
+    marks = ",".join("?" * len(domains))
+    with conn:
+        n = conn.execute(f"DELETE FROM reports WHERE domain IN ({marks})", domains).rowcount
+        # どのレコードからも参照されなくなった逆引きキャッシュも消す
+        conn.execute("DELETE FROM ip_info WHERE ip NOT IN (SELECT DISTINCT source_ip FROM records)")
+    return n
+
+
+def domain_counts(conn: sqlite3.Connection, domains: Iterable[str]):
+    domains = [d.lower() for d in domains]
+    marks = ",".join("?" * len(domains))
+    return conn.execute(f"SELECT domain, COUNT(*) FROM reports WHERE domain IN ({marks}) "
+                        f"GROUP BY domain ORDER BY domain", domains).fetchall() if domains else []
+
+
 def unresolved_ips(conn: sqlite3.Connection) -> Iterable[str]:
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT source_ip FROM records WHERE source_ip NOT IN (SELECT ip FROM ip_info)"

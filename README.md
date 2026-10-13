@@ -25,10 +25,15 @@ DMARC 集計レポート (rua) のメールを取り込み、SQLite に蓄積・
 
 ```bash
 python3 -m dmarc_dashboard demo
-python3 -m dmarc_dashboard serve
+python3 -m dmarc_dashboard --db data/demo.sqlite3 serve
 ```
 
-ブラウザで http://127.0.0.1:8080/ を開きます。
+ブラウザで http://127.0.0.1:8080/ を開きます。サンプルデータは本番とは別の DB (`data/demo.sqlite3`) に作られるので、本番のデータには混ざりません。
+
+※ 以前の版では `demo` が本番の DB に書き込んでいました。本番の画面に `example.co.jp` などのサンプルドメインが出る場合は、次のコマンドで削除してください (確認のうえ削除します)。
+```bash
+python3 -m dmarc_dashboard delete-domain --demo
+```
 
 ## 本番での使い方 (さくらのメール + Apache サブディレクトリ公開)
 
@@ -98,9 +103,10 @@ ProxyPassReverse /dmarc_dashboard http://127.0.0.1:8080/dmarc_dashboard
 | `folders` | IMAP のフォルダ一覧を表示 (接続確認) |
 | `resolve` | 送信元 IP の逆引きを更新 |
 | `serve [--host --port --fetch-interval 秒]` | ダッシュボードを起動 |
-| `demo` | サンプルデータを生成して取り込む |
+| `demo` | サンプルデータを生成して取り込む (既定の DB は `data/demo.sqlite3`) |
+| `delete-domain <domain...> [--demo] [-y]` | 指定したドメインのデータを削除する (`--demo` でサンプルドメインを削除) |
 
-共通オプション: `-c config.ini` (設定ファイル), `-v` (詳細ログ)
+共通オプション: `-c config.ini` (設定ファイル), `--db <ファイル>` (使う DB を指定), `-v` (詳細ログ)。共通オプションはコマンド名の前に書きます
 
 ### Docker
 
