@@ -262,3 +262,11 @@ dialog::backdrop { background: rgba(0,0,0,.35); }
   .hero-value { font-size: 48px; }
   .filters { position: static; }
 }
+
+.h-sub { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+.field.small { font-size: 12px; }
+.from-list { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; }
+.from.mism { font-weight: 600; }
+.from .x { color: var(--critical); font-weight: 700; }
+.pill.warn-pill { margin-left: 6px; border-color: var(--serious); }
+.sys-actions { margin-bottom: 8px; }

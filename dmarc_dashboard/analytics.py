@@ -153,6 +153,34 @@ def override_reasons(reasons: str) -> List[str]:
     return out
 
 
+def system_key(envelope_from: str, spf_domain: str, spf_scope: str):
+    """どの送信システムのメールかを識別するキー (ドメイン, 種類) を返す。
+
+    Envelope From (Return-Path) のドメインは送信システムごとに決まっていることが多いため、これを使う。
+    レポートに Envelope From がなければ SPF の検査ドメイン (= MAIL FROM のドメイン) で代用する。
+    Envelope From が空のメール (エラーメール等) は SPF が HELO 名で検査されるので、その送信サーバー名を使う。
+    種類: mfrom / helo / unknown
+    """
+    env = (envelope_from or "").lower().strip()
+    if "@" in env:  # まれにアドレスごと書くレポーターがある
+        env = env.rsplit("@", 1)[1]
+    spf_domain = (spf_domain or "").lower().strip()
+    if (spf_scope or "").lower() == "helo":
+        return spf_domain, "helo"
+    if env:
+        return env, "mfrom"
+    if spf_domain:
+        return spf_domain, "mfrom"
+    return "", "unknown"
+
+
+def _row_system(row, level: str = "domain"):
+    key, kind = system_key(row["envelope_from"], row["spf_domain"], row["spf_scope"])
+    if level == "org" and key:
+        key = org_domain(key)
+    return key, kind
+
+
 def _dkim_pairs(dkim_domains: str):
     return [tuple(x.rsplit(":", 1)) for x in (dkim_domains or "").split(",") if ":" in x]
 
@@ -249,7 +277,7 @@ def dashboard(conn: sqlite3.Connection, domain: Optional[str] = None,
         f"GROUP BY rp.domain", args)}
 
     # 送信元 IP 別 (全体の表示用と、ドメインごとの診断用を同時に集計する)
-    src, dom_src = {}, defaultdict(dict)
+    src, dom_src, sys_acc, sys_org_acc = {}, defaultdict(dict), {}, {}
     for row in conn.execute(f"""
         SELECT rp.domain, r.source_ip ip, r.count, r.dmarc_pass, r.spf_eval, r.dkim_eval, r.disposition,
                r.header_from, r.envelope_from, r.spf_domain, r.spf_result, r.spf_scope, r.dkim_domains,
@@ -258,7 +286,11 @@ def dashboard(conn: sqlite3.Connection, domain: Optional[str] = None,
         LEFT JOIN ip_info i ON i.ip = r.source_ip{where}""", args):
         _accumulate(src, row)
         _accumulate(dom_src[row["domain"]], row)
+        _accumulate(sys_acc, row, _row_system(row))
+        _accumulate(sys_org_acc, row, _row_system(row, "org"))
     sources = _finish_sources(src)
+    systems = _finish_systems(sys_acc)
+    systems_org = _finish_systems(sys_org_acc)
 
     ins = []
     for d in domain_list:
@@ -286,24 +318,33 @@ def dashboard(conn: sqlite3.Connection, domain: Optional[str] = None,
         "filter": {"domain": domain, "start": start, "end": end},
         "kpi": kpi, "daily": daily, "auth_matrix": auth_matrix, "reporters": reporters,
         "domains": domain_list, "sources": sources[:300], "reports": reports,
+        "systems": systems[:300], "systems_org": systems_org[:300],
         "insights": ins,
         "glossary": advice.GLOSSARY,
     }
 
 
-def _accumulate(src: Dict, row) -> None:
-    s = src.setdefault(row["ip"], {
+def _accumulate(src: Dict, row, key=None) -> None:
+    """集計用の辞書に 1 行を加える。key を省略すると送信元 IP ごとに集計する。"""
+    s = src.setdefault(row["ip"] if key is None else key, {
         "ip": row["ip"], "ptr": row["ptr"], "provider": provider_of(row["ptr"]),
         "messages": 0, "pass": 0, "spf_aligned": 0, "dkim_aligned": 0,
         "spf_raw_pass": 0, "dkim_raw_pass": 0, "header_from": set(), "spf_domains": set(),
         "dkim_domains": set(), "quarantine": 0, "reject": 0, "fail_reasons": defaultdict(int),
+        "ip_msgs": defaultdict(int), "ip_fail": defaultdict(int), "ip_ptr": {},
+        "fail_auth": 0,  # DMARC に失敗したが、SPF か DKIM の認証自体は通っていた通数
     })
     c = row["count"]
+    s["ip_msgs"][row["ip"]] += c
+    s["ip_fail"][row["ip"]] += 0 if row["dmarc_pass"] else c
+    s["ip_ptr"][row["ip"]] = row["ptr"]
     if not row["dmarc_pass"]:
         for f in failure_reasons(row["header_from"], row["spf_eval"], row["dkim_eval"],
                                  (row["spf_domain"], row["spf_result"], row["spf_scope"]), _dkim_pairs(row["dkim_domains"]),
                                  row["adkim"], row["aspf"], row["envelope_from"]):
             s["fail_reasons"][f["code"]] += c
+    if not row["dmarc_pass"] and (row["spf_result"] == "pass" or ":pass" in (row["dkim_domains"] or "")):
+        s["fail_auth"] += c
     s["messages"] += c
     s["pass"] += c if row["dmarc_pass"] else 0
     s["spf_aligned"] += c if row["spf_eval"] == "pass" else 0
@@ -324,7 +365,7 @@ def _accumulate(src: Dict, row) -> None:
 def _finish_sources(src: Dict) -> List[Dict]:
     out = []
     for s in src.values():
-        s = dict(s)
+        s = {k: v for k, v in s.items() if k not in ("ip_msgs", "ip_fail", "ip_ptr")}
         s["fail"] = s["messages"] - s["pass"]
         s["pass_rate"] = _rate(s["pass"], s["messages"])
         for key in ("header_from", "spf_domains", "dkim_domains"):
@@ -340,12 +381,85 @@ def _finish_sources(src: Dict) -> List[Dict]:
     return out
 
 
+def _top_ips(s: Dict, n: int = 5) -> List[Dict]:
+    ips = sorted(s["ip_msgs"].items(), key=lambda kv: (-s["ip_fail"][kv[0]], -kv[1]))
+    return [{"ip": ip, "ptr": s["ip_ptr"].get(ip, ""), "provider": provider_of(s["ip_ptr"].get(ip, "")),
+             "messages": m, "fail": s["ip_fail"][ip]} for ip, m in ips[:n]]
+
+
+def _finish_systems(acc: Dict) -> List[Dict]:
+    out = []
+    for (key, kind), s in acc.items():
+        f = _finish_sources({0: s})[0]
+        own = {org_domain(h) for h in f["header_from"]}
+        f.update(
+            key=key, kind=kind, org=org_domain(key) if key else "",
+            # From のドメインと Envelope From のドメインが組織として違う (= SPF では合格できない)
+            from_mismatch=sorted(h for h in f["header_from"] if key and org_domain(h) != org_domain(key)),
+            ip_count=len(s["ip_msgs"]), top_ips=_top_ips(s),
+            providers=sorted({provider_of(p) for p in s["ip_ptr"].values()} - {""}),
+            dkim_own=sorted(d for d in f["dkim_domains"] if org_domain(d) in own),
+        )
+        for k in ("ip", "ptr", "provider"):
+            f.pop(k, None)
+        f["advice"] = system_advice(f)
+        out.append(f)
+    out.sort(key=lambda x: (-x["fail"], -x["messages"]))
+    return out
+
+
+def system_advice(s: Dict) -> List[Dict]:
+    """送信システム単位の対策 (メールに詳しくない人向け)。"""
+    if not s["fail"]:
+        return []
+    key, mism = s["key"], s["from_mismatch"]
+    acts = []
+    hint = next((advice.provider_hint(p) for p in s["providers"] if advice.provider_hint(p)), "")
+    if s["kind"] == "helo":
+        return advice.FAILURE_HELP["spf_helo"]["actions"]
+    if s["kind"] == "unknown":
+        return advice.FAILURE_HELP["other"]["actions"]
+    if s["status"] == "unauthenticated" and not s["spf_raw_pass"] and not s["dkim_raw_pass"]:
+        return advice.FAILURE_HELP["spf_fail"]["actions"]
+    if mism:
+        froms = ", ".join(mism[:4]) + (" など" if len(mism) > 4 else "")
+        acts.append({
+            "title": "対策 1 (おすすめ): From のドメインごとに DKIM 署名する",
+            "detail": f"このシステムは Envelope From (Return-Path) に {key} を使っているため、From が {froms} のメールは SPF では合格できません。"
+                      f"このシステムで、From のドメインと同じドメインの DKIM 署名 (例: From が {mism[0]} なら d={mism[0]}) を付けるように設定してください。"
+                      + (" " + hint if hint else "")})
+        acts.append({
+            "title": "対策 2: Return-Path を From と同じドメイン配下にする",
+            "detail": f"システムの設定で、From のドメインごとに Return-Path を切り替えられる場合は、bounce.{mism[0]} のように From と同じドメイン配下にして、"
+                      "そのドメインの SPF にこのシステムの送信サーバーを登録します。グループ共通のシステムなら、システムの担当者に相談してください。"})
+    elif s["fail"] > s["fail_auth"]:
+        acts.append({
+            "title": "判断: 失敗している送信元 IP が、自社のサーバーかどうか",
+            "detail": f"Envelope From は From と同じドメイン ({key}) なので、自社のドメインを名乗るメールです。"
+                      "下の「送信元 IP」で失敗している IP のホスト名を確認してください。"
+                      "自社や委託先のサーバーなら設定漏れ、心当たりがなければなりすましです。"})
+        acts.append({
+            "title": "自社のサーバーだった場合: SPF への登録と DKIM 署名",
+            "detail": f"{key} の SPF レコードに、そのサーバー (またはサービスが案内する include:) を追加し、DKIM 署名も設定します。"
+                      + (" " + hint if hint else "")})
+        acts.append({
+            "title": "心当たりがない場合 (なりすまし): SPF に追加しない",
+            "detail": "なりすましの IP を SPF に追加してはいけません。正規の送信元をすべて直したうえで、DMARC のポリシーを強化すると、受信側で止められます。"})
+    if not acts:
+        acts = advice.FAILURE_HELP[s["fail_reasons"][0]["code"]]["actions"] if s["fail_reasons"] else []
+    acts.append({"title": "確認: 送信元 IP からシステムを特定する",
+                 "detail": "下の「送信元 IP」のホスト名やサービス名を見て、どのシステム・委託先かを特定してください。心当たりがない IP は、なりすましの可能性があります。"})
+    return acts
+
+
 def _source_status(s: Dict) -> str:
     rate = s["pass"] / s["messages"] if s["messages"] else 0
     if rate >= 0.98:
         return "ok"
-    if s["spf_raw_pass"] or s["dkim_raw_pass"]:
-        return "misaligned"  # 認証自体は通るがドメインが一致していない → 設定不備の正規送信元の可能性
+    fail = s["messages"] - s["pass"]
+    if fail and s.get("fail_auth", 0) >= fail * 0.5:
+        # 失敗したメールの多くが、認証自体は通っている (ドメインが一致していないだけ) → 設定不備の正規送信元の可能性
+        return "misaligned"
     if rate > 0:
         return "partial"
     return "unauthenticated"  # なりすまし / 未設定の送信元の可能性
@@ -387,6 +501,41 @@ def record_details(conn: sqlite3.Connection, ip: str, domain: Optional[str] = No
         d["overrides"] = override_reasons(d["reasons"])
         out.append(d)
     return {"summary": summary, "records": out}
+
+
+def system_details(conn: sqlite3.Connection, key: str, kind: str, level: str = "domain",
+                   domain: Optional[str] = None, start: Optional[int] = None, end: Optional[int] = None) -> Dict:
+    """送信システム 1 件の詳細: 総評と対策、From ドメイン別・送信元 IP 別の内訳。"""
+    where, args = _where(domain, start, end)
+    total, by_from, by_ip = {}, {}, {}
+    for row in conn.execute(f"""
+        SELECT r.source_ip ip, r.count, r.dmarc_pass, r.spf_eval, r.dkim_eval, r.disposition,
+               r.header_from, r.envelope_from, r.spf_domain, r.spf_result, r.spf_scope, r.dkim_domains,
+               rp.adkim, rp.aspf, COALESCE(i.ptr, '') ptr
+        FROM records r JOIN reports rp ON rp.id = r.report_pk
+        LEFT JOIN ip_info i ON i.ip = r.source_ip{where}""", args):
+        if _row_system(row, level) != (key, kind):
+            continue
+        _accumulate(total, row, (key, kind))
+        _accumulate(by_from, row, row["header_from"] or "")
+        _accumulate(by_ip, row)
+    systems = _finish_systems(total)
+    if not systems:
+        return {"summary": None, "by_from": [], "by_ip": []}
+    summary = systems[0]
+    summary["status_help"] = advice.STATUS_HELP[summary["status"]]
+    froms = []
+    for hf, s in by_from.items():
+        f = _finish_sources({0: s})[0]
+        f["header_from"] = hf
+        f["aligned_env"] = bool(key) and org_domain(hf) == org_domain(key)
+        for k in ("ip", "ptr", "provider"):
+            f.pop(k, None)
+        froms.append(f)
+    froms.sort(key=lambda x: (-x["fail"], -x["messages"]))
+    ips = _finish_sources(by_ip)
+    ips.sort(key=lambda x: (-x["fail"], -x["messages"]))
+    return {"summary": summary, "by_from": froms, "by_ip": ips[:200]}
 
 
 SEVERITY_ORDER = {"critical": 0, "serious": 1, "warning": 2, "good": 3, "info": 4}

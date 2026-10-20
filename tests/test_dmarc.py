@@ -212,6 +212,31 @@ class StoreAndAnalyticsTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0], 2)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM ip_info").fetchone()[0], 1)
 
+    def test_system_key(self):
+        sk = analytics.system_key
+        self.assertEqual(sk("example.co.jp", "example.co.jp", "mfrom"), ("example.co.jp", "mfrom"))
+        self.assertEqual(sk("", "bounce.example.com", "mfrom"), ("bounce.example.com", "mfrom"))  # 記載なし → SPF ドメイン
+        self.assertEqual(sk("", "bounce.example.com", ""), ("bounce.example.com", "mfrom"))
+        self.assertEqual(sk("", "mx1.example.com", "helo"), ("mx1.example.com", "helo"))
+        self.assertEqual(sk("user@Bounce.Example.com", "", ""), ("bounce.example.com", "mfrom"))
+        self.assertEqual(sk("", "", ""), ("", "unknown"))
+
+    def test_systems(self):
+        ingest.import_bytes(self.conn, XML, "a.xml")
+        d = analytics.dashboard(self.conn)
+        sysm = {x["key"]: x for x in d["systems"]}
+        # 198.51.100.1 は Envelope From の記載がないので SPF ドメイン (sendgrid.net) でまとまる
+        self.assertEqual(sysm["sendgrid.net"]["from_mismatch"], ["example.co.jp"])
+        self.assertEqual(sysm["sendgrid.net"]["status"], "misaligned")
+        self.assertIn("DKIM", sysm["sendgrid.net"]["advice"][0]["title"])
+        self.assertEqual(sysm["example.co.jp"]["status"], "ok")
+        self.assertEqual(d["systems"][0]["key"], "sendgrid.net")  # 失敗の多い順
+        det = analytics.system_details(self.conn, "sendgrid.net", "mfrom")
+        self.assertEqual(det["by_from"][0]["header_from"], "example.co.jp")
+        self.assertFalse(det["by_from"][0]["aligned_env"])
+        self.assertEqual([i["ip"] for i in det["by_ip"]], ["198.51.100.1"])
+        self.assertIsNone(analytics.system_details(self.conn, "nothing.example", "mfrom")["summary"])
+
     def test_org_domain(self):
         self.assertEqual(analytics.org_domain("mail.shop.example.co.jp"), "example.co.jp")
         self.assertEqual(analytics.org_domain("bounce.example.com"), "example.com")
@@ -257,6 +282,8 @@ class ServerTest(unittest.TestCase):
         res = json.load(self.req("/api/source?ip=198.51.100.1"))
         self.assertEqual(res["records"][0]["count"], 50)
         self.assertEqual(res["summary"]["status"], "misaligned")
+        res = json.load(self.req("/api/system?key=sendgrid.net&kind=mfrom"))
+        self.assertEqual(res["summary"]["fail"], 50)
 
     def test_base_path(self):
         # プレフィックス付き (ProxyPass で /dmarc_dashboard/ を残して転送する構成)

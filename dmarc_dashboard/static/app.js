@@ -21,7 +21,7 @@ const SEVERITY = {
   info: { label: "情報", c: "var(--muted)", ic: "i" },
 };
 
-const state = { days: 30, from: "", to: "", domain: "", srcFilter: "" };
+const state = { days: 30, from: "", to: "", domain: "", srcFilter: "", sysFilter: "", sysOrg: false };
 // 診断の表示状態 (画面の中だけで保持)
 const insView = { hidden: new Set(["info"]), groupOpen: new Map(), expandAll: false };
 let data = null;
@@ -340,6 +340,7 @@ function render() {
     { label: "DKIM 整合", num: 1, render: (r) => pct((r.dkim * 100) / (r.messages || 1)) },
   ], d.domains, (r) => selectDomain(r.domain));
 
+  renderSystems();
   renderSources();
 
   table("#tbl-reports", [
@@ -439,6 +440,74 @@ async function goTarget(i) {
   $("#tbl-sources").closest("section").scrollIntoView({ behavior: "smooth" });
 }
 
+// ---------- 送信システム別 ----------
+const KIND_LABEL = { helo: "HELO (エラーメール/自動返信)", unknown: "記載なし" };
+function sysName(r) {
+  return el("span", {}, r.key ? el("span", { class: "mono" }, r.key) : el("span", { class: "dim" }, "(Envelope From・SPF とも記載なし)"),
+    KIND_LABEL[r.kind] && r.key ? el("span", {}, " ", el("span", { class: "pill" }, KIND_LABEL[r.kind])) : null);
+}
+function fromList(r) {
+  const mism = new Set(r.from_mismatch);
+  return el("span", { class: "from-list" }, r.header_from.slice(0, 6).map((h) => el("span", {
+    class: mism.has(h) ? "from mism" : "from",
+    title: mism.has(h) ? "Envelope From とドメインが違うため、SPF では合格できません" : "Envelope From と同じドメイン",
+  }, h, mism.has(h) ? el("span", { class: "x" }, " ≠") : null)), r.header_from.length > 6 ? el("span", { class: "dim" }, ` 他${r.header_from.length - 6}`) : null);
+}
+function renderSystems() {
+  const f = state.sysFilter;
+  const all = data[state.sysOrg ? "systems_org" : "systems"] || [];
+  const rows = all.filter((s) => !f || (f === "fail" ? s.fail > 0 : s.from_mismatch.length > 0));
+  table("#tbl-systems", [
+    { label: "状態", render: (r) => badge(STATUS[r.status]) },
+    { label: "送信システム (Envelope From / SPF ドメイン)", render: sysName },
+    { label: "送信元", render: (r) => el("span", {}, r.providers.map((p) => el("span", { class: "pill" }, p)), r.providers.length ? " " : null,
+      el("span", { class: "dim" }, `IP ${fmt(r.ip_count)} 件`)) },
+    { label: "From ドメイン", cls: "wrap", render: fromList },
+    { label: "メッセージ", num: 1, render: (r) => fmt(r.messages) },
+    { label: "失敗", num: 1, render: (r) => fmt(r.fail) },
+    { label: "主な失敗理由", render: (r) => failSummary(r) },
+    { label: "合格率", render: (r) => meter(r.pass_rate) },
+    { label: "SPF 整合", num: 1, render: (r) => pct((r.spf_aligned * 100) / r.messages) },
+    { label: "DKIM 整合", num: 1, render: (r) => pct((r.dkim_aligned * 100) / r.messages) },
+    { label: "DKIM 署名", cls: "dim", render: (r) => r.dkim_domains.join(", ") || "なし" },
+  ], rows, openSystem);
+}
+
+async function openSystem(sys) {
+  $("#detail-title").textContent = `送信システム: ${sys.key || "(記載なし)"}${KIND_LABEL[sys.kind] && sys.key ? ` [${KIND_LABEL[sys.kind]}]` : ""}`;
+  const det = await api(`api/system?${params({ key: sys.key, kind: sys.kind, level: state.sysOrg ? "org" : "domain" })}`);
+  const sm = det.summary;
+  detailSummary(sm, sm ? sm.advice : []);
+  const extra = $("#detail-extra");
+  extra.replaceChildren(el("h3", { class: "sub-h" }, "From ドメイン別"));
+  const tf = el("table");
+  table(tf, [
+    { label: "From ドメイン", render: (r) => el("span", {}, r.header_from,
+      r.aligned_env ? null : el("span", { class: "pill warn-pill", title: "Envelope From とドメインが違うため、SPF では合格できません" }, "Envelope From と不一致")) },
+    { label: "メッセージ", num: 1, render: (r) => fmt(r.messages) },
+    { label: "失敗", num: 1, render: (r) => fmt(r.fail) },
+    { label: "合格率", render: (r) => meter(r.pass_rate) },
+    { label: "SPF 整合", num: 1, render: (r) => pct((r.spf_aligned * 100) / r.messages) },
+    { label: "DKIM 整合", num: 1, render: (r) => pct((r.dkim_aligned * 100) / r.messages) },
+    { label: "DKIM 署名", cls: "dim", render: (r) => r.dkim_domains.join(", ") || "なし" },
+    { label: "主な失敗理由", render: (r) => failSummary(r) },
+  ], det.by_from);
+  extra.append(el("div", { class: "table-wrap" }, tf));
+  $("#detail-table-h").textContent = "送信元 IP 別 (クリックで IP ごとの詳細)";
+  table("#tbl-detail", [
+    { label: "状態", render: (r) => badge(STATUS[r.status]) },
+    { label: "送信元 IP", cls: "mono", render: (r) => r.ip },
+    { label: "ホスト名 (PTR)", render: (r) => el("span", {}, r.provider ? el("span", { class: "pill" }, r.provider) : null, r.provider ? " " : null, el("span", { class: "dim" }, r.ptr || "(逆引きなし)")) },
+    { label: "From ドメイン", render: (r) => r.header_from.join(", ") },
+    { label: "メッセージ", num: 1, render: (r) => fmt(r.messages) },
+    { label: "失敗", num: 1, render: (r) => fmt(r.fail) },
+    { label: "主な失敗理由", render: (r) => failSummary(r) },
+    { label: "合格率", render: (r) => meter(r.pass_rate) },
+  ], det.by_ip, (r) => openDetail(r));
+  if (!$("#detail").open) $("#detail").showModal();
+  $("#detail").scrollTop = 0;
+}
+
 function renderSources() {
   const f = state.srcFilter;
   const rows = data.sources.filter((s) => !f || (f === "fail" ? s.fail > 0 : s.status === f));
@@ -493,10 +562,10 @@ function helpBlock(h) {
       h.actions.map((a) => el("li", {}, el("b", {}, a.title), el("p", {}, a.detail)))));
 }
 
-function detailSummary(sm) {
+function detailSummary(sm, actions) {
   const host = $("#detail-summary");
   host.replaceChildren();
-  if (!sm) return;
+  if (!sm) { host.append(el("p", { class: "dim" }, "この期間のデータがありません")); return; }
   host.append(el("div", { class: "sum-head" },
     badge(STATUS[sm.status]),
     el("span", {}, `${fmt(sm.messages)} 通中 ${fmt(sm.fail)} 通が DMARC に失敗 (合格率 ${pct(sm.pass_rate)})`)));
@@ -504,10 +573,14 @@ function detailSummary(sm) {
   if (sm.provider_hint) {
     host.append(el("div", { class: "hint" }, el("b", {}, `${sm.provider} での設定方法: `), sm.provider_hint));
   }
+  if (actions && actions.length) {
+    host.append(el("h3", { class: "sub-h" }, "このシステムの対策"),
+      el("ul", { class: "actions sys-actions" }, actions.map((a) => el("li", {}, el("b", {}, a.title), el("p", {}, a.detail)))));
+  }
   if (sm.fail_reasons.length) {
-    host.append(el("h3", { class: "sub-h" }, "失敗の理由と対策"));
+    host.append(el("h3", { class: "sub-h" }, actions && actions.length ? "失敗の理由ごとの説明" : "失敗の理由と対策"));
     sm.fail_reasons.forEach((f, idx) => {
-      host.append(el("details", { class: "reason-card", open: idx === 0 },
+      host.append(el("details", { class: "reason-card", open: idx === 0 && !(actions && actions.length) },
         el("summary", {}, el("b", {}, f.label), el("span", { class: "dim" }, ` ${fmt(f.messages)} 通`)),
         helpBlock(f.help)));
     });
@@ -520,6 +593,8 @@ async function openDetail(src, domainOverride) {
   if (domainOverride) extra.domain = domainOverride;
   const det = await api(`api/source?${params(extra)}`);
   detailSummary(det.summary);
+  $("#detail-extra").replaceChildren();
+  $("#detail-table-h").textContent = "レポートの内容";
   const res = (v) => el("span", { class: v === "pass" ? "res-pass" : v === "none" ? "dim" : "res-fail" }, v);
   table("#tbl-detail", [
     { label: "期間", render: (r) => `${dateStr(r.begin_ts)}` },
@@ -534,7 +609,7 @@ async function openDetail(src, domainOverride) {
     { label: "認証結果 (生)", cls: "wrap", render: (r) => el("span", {}, r.auth.map((a, i) => el("span", {},
       i ? " · " : "", `${a.kind.toUpperCase()} ${a.domain}${a.selector ? ` (${a.selector})` : ""}${a.scope ? ` [${a.scope}]` : ""}: `, res(a.result)))) },
   ], det.records);
-  $("#detail").showModal();
+  if (!$("#detail").open) $("#detail").showModal();
   $("#detail").scrollTop = 0;
 }
 
@@ -645,6 +720,12 @@ document.querySelectorAll("#src-filter button").forEach((b) => b.addEventListene
   document.querySelectorAll("#src-filter button").forEach((x) => x.classList.toggle("on", x === b));
   renderSources();
 }));
+document.querySelectorAll("#sys-filter button").forEach((b) => b.addEventListener("click", () => {
+  state.sysFilter = b.dataset.f;
+  document.querySelectorAll("#sys-filter button").forEach((x) => x.classList.toggle("on", x === b));
+  renderSystems();
+}));
+$("#sys-org").addEventListener("change", (e) => { state.sysOrg = e.target.checked; renderSystems(); });
 $("#upload").addEventListener("change", (e) => { uploadFiles([...e.target.files]); e.target.value = ""; });
 $("#fetch-btn").addEventListener("click", async () => {
   const b = $("#fetch-btn"); b.disabled = true; toast("メールを取得中…");

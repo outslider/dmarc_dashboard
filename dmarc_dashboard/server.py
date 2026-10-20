@@ -140,6 +140,16 @@ def make_handler(app: App):
                     finally:
                         conn.close()
                     return self._json(data)
+                if url.path == "/api/system":
+                    conn = app.conn()
+                    try:
+                        res = analytics.system_details(
+                            conn, q.get("key", ""), q.get("kind", "mfrom"),
+                            "org" if q.get("level") == "org" else "domain", q.get("domain") or None,
+                            _day_ts(q.get("from")), _day_ts(q.get("to"), 1))
+                    finally:
+                        conn.close()
+                    return self._json(res)
                 if url.path == "/api/source":
                     conn = app.conn()
                     try:

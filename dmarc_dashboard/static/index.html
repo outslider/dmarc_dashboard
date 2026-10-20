@@ -106,9 +106,26 @@
     <div class="table-wrap"><table id="tbl-domains"></table></div>
   </section>
 
+  <section class="card" id="systems-card">
+    <div class="card-head">
+      <h2>送信システム別 <span class="h-sub">Envelope From / SPF ドメイン</span></h2>
+      <div class="ins-tools">
+        <div class="seg small" id="sys-filter">
+          <button data-f="" class="on">すべて</button>
+          <button data-f="fail">失敗あり</button>
+          <button data-f="mismatch">From と不一致</button>
+        </div>
+        <label class="field small"><input type="checkbox" id="sys-org"> 組織ドメインでまとめる</label>
+      </div>
+    </div>
+    <p class="note">メールの裏側の差出人 (Envelope From / Return-Path) は送信システムごとに決まっていることが多いため、これでまとめると「どのシステムから送られたメールか」が分かります。
+      レポートに記載がない場合は SPF の検査ドメインで代用しています。行をクリックすると、From ドメイン別・送信元 IP 別の内訳と対策を表示します。</p>
+    <div class="table-wrap scroll"><table id="tbl-systems"></table></div>
+  </section>
+
   <section class="card">
     <div class="card-head">
-      <h2>送信元</h2>
+      <h2>送信元 IP 別</h2>
       <div class="seg small" id="src-filter">
         <button data-f="" class="on">すべて</button>
         <button data-f="fail">失敗あり</button>
@@ -132,7 +149,8 @@
     <button class="btn" id="detail-close">閉じる</button>
   </div>
   <div id="detail-summary"></div>
-  <h3 class="sub-h">レポートの内容</h3>
+  <div id="detail-extra"></div>
+  <h3 class="sub-h" id="detail-table-h">レポートの内容</h3>
   <div class="table-wrap"><table id="tbl-detail"></table></div>
 </dialog>
 
