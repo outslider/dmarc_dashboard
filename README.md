@@ -140,3 +140,7 @@ dmarc_dashboard/
 deploy/         Apache 設定例 / systemd ユニット例
 tests/          python3 -m unittest で実行
 ```
+
+## ライセンス
+
+[MIT License](LICENSE)
